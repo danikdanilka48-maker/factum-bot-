@@ -46,7 +46,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = ask_groq(cleaned) + CHANNEL_FOOTER
         await update.message.reply_text(result, parse_mode="Markdown")
     except Exception as e:
-        await update.message.reply_text(f"Помилка: {e}")
+        import traceback
+        await update.message.reply_text(f"Помилка: {e}\n{traceback.format_exc()}")
 
 if __name__ == "__main__":
     loop = asyncio.new_event_loop()
