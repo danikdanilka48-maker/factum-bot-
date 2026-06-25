@@ -36,6 +36,8 @@ def ask_groq(text):
     }
     r = requests.post(url, headers=headers, json=body, timeout=30)
     data = r.json()
+    if "choices" not in data:
+        raise Exception(str(data))
     return data["choices"][0]["message"]["content"].strip()
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
