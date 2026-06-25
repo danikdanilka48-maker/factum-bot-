@@ -7,7 +7,7 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTyp
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-CHANNEL_FOOTER = "\n[Фактум Новини | Підписатись](https://t.me/factum_ua)"
+CHANNEL_FOOTER = "\n\n[Фактум Новини | Підписатись](https://t.me/factum_ua)"
 
 def clean_text(text):
     text = re.sub(r'\[.*?\]\(https?://\S+\)', '', text)
@@ -22,7 +22,7 @@ def ask_groq(text):
     }
     prompt = f"""Ти — редактор українського новинного Telegram-каналу.
 Твоє завдання:
-1. Перефразуй новину українською мовою — стисло, чітко, журналістським стилем
+1. Перефразуй новину українською мовою — стисло, чітко, журналістським стилем. Перший рядок (заголовок) зроби жирним через **текст**
 2. Якщо новина звичайна — постав на початку ⚡️
 3. Якщо новина важлива (бойові дії, прориви, загрози, офіційні заяви) — постав ⚡️⚡️⚡️
 4. НЕ додавай жодних посилань, підписів, хештегів
