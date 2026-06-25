@@ -1,11 +1,12 @@
 import os
 import re
 import requests
+import asyncio
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 CHANNEL_FOOTER = "\n[Фактум Новини | Підписатись](https://t.me/factum_ua)"
 
 def clean_text(text):
@@ -13,8 +14,12 @@ def clean_text(text):
     text = re.sub(r'https?://\S+', '', text)
     return text.strip()
 
-def ask_gemini(text):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+def ask_groq(text):
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
     prompt = f"""Ти — редактор українського новинного Telegram-каналу.
 Твоє завдання:
 1. Перефразуй новину українською мовою — стисло, чітко, журналістським стилем
@@ -25,26 +30,28 @@ def ask_gemini(text):
 
 Текст новини:
 {text}"""
-    body = {"contents": [{"parts": [{"text": prompt}]}]}
-    r = requests.post(url, json=body, timeout=30)
+    body = {
+        "model": "llama3-8b-8192",
+        "messages": [{"role": "user", "content": prompt}]
+    }
+    r = requests.post(url, headers=headers, json=body, timeout=30)
     data = r.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    return data["choices"][0]["message"]["content"].strip()
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text
     cleaned = clean_text(raw)
     await update.message.reply_text("⏳ Форматую...")
     try:
-        result = ask_gemini(cleaned) + CHANNEL_FOOTER
+        result = ask_groq(cleaned) + CHANNEL_FOOTER
         await update.message.reply_text(result, parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"Помилка: {e}")
 
 if __name__ == "__main__":
-    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Бот запущено")
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     app.run_polling()
