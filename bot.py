@@ -26,7 +26,7 @@ def ask_gemini(text):
 Текст новини:
 {text}"""
     body = {"contents": [{"parts": [{"text": prompt}]}]}
-    r = requests.post(url, json=body)
+    r = requests.post(url, json=body, timeout=30)
     data = r.json()
     return data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
@@ -40,7 +40,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Помилка: {e}")
 
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-print("Бот запущено")
-app.run_polling()
+if __name__ == "__main__":
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    print("Бот запущено")
+    app.run_polling()
