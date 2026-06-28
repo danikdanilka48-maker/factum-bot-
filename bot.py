@@ -43,15 +43,19 @@ def ask_groq(text, importance, length):
 
     prompt = f"""Ти — досвідчений редактор українського новинного Telegram-каналу.
 
-Перефразуй новину українською мовою. Вимоги:
-- Починай з {emoji}
-- Перший рядок — жирний заголовок: **Заголовок**
-- Далі з нового рядка — текст новини ({size})
-- Стиль: чіткий, журналістський, без води
-- НЕ додавай посилань, хештегів, підписів
-- Поверни ТІЛЬКИ готовий пост
+Перефразуй новину українською мовою. Суворі вимоги:
+- Починай рядок з емодзі {emoji} БЕЗ пробілу після нього, одразу жирний заголовок
+- Жирний текст роби через подвійні зірочки: **Заголовок**
+- Після заголовку з нового рядка — текст новини ({size})
+- Стиль: чіткий, журналістський, без води, правильна українська мова
+- НЕ додавай посилань, хештегів, підписів, пояснень
+- Поверни ТІЛЬКИ готовий пост, нічого більше
 
-Текст новини:
+Приклад формату:
+⚡️**Заголовок новини**
+Текст новини тут.
+
+Текст новини для переробки:
 {text}"""
 
     body = {
@@ -90,7 +94,7 @@ async def handle_length(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Форматую...", reply_markup=ReplyKeyboardRemove())
     try:
         result = ask_groq(text, importance, length) + CHANNEL_FOOTER
-        await update.message.reply_text(result, parse_mode="Markdown")
+        await update.message.reply_text(result, parse_mode="MarkdownV2")
     except Exception as e:
         await update.message.reply_text(f"Помилка: {e}")
     return ConversationHandler.END
