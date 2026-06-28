@@ -94,7 +94,7 @@ async def handle_length(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Форматую...", reply_markup=ReplyKeyboardRemove())
     try:
         result = ask_groq(text, importance, length) + CHANNEL_FOOTER
-        await update.message.reply_text(result, parse_mode="MarkdownV2")
+        await update.message.reply_text(result, parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"Помилка: {e}")
     return ConversationHandler.END
