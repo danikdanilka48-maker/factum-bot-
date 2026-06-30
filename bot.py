@@ -9,7 +9,7 @@ from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, fil
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])  # твой Telegram ID
+ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
 CHANNEL_FOOTER = "\n\n[Фактум Новини | Підписатись](https://t.me/factum_ua)"
 
 WAIT_IMPORTANCE, WAIT_LENGTH = range(2)
@@ -40,32 +40,27 @@ def clean_text(text):
     return text.strip()
 
 
-def ensure_bold_first_sentence(result: str) -> str:
-    """Подстраховка: если ИИ забыл сделать жирным первое предложение — делаем сами."""
-    result = result.strip()
-    if result.startswith("**"):
-        return result  # уже жирный
+def build_post(raw_ai_text: str, emoji: str) -> str:
+    """Берёт чистый текст от ИИ (без эмодзи и звёздочек), делает первое
+    предложение жирным через одинарные * (старый Markdown) и добавляет
+    пустую строку-отступ перед остальным текстом."""
+    text = raw_ai_text.strip()
+    text = re.sub(r'^(⚡️)+', '', text).strip()
+    text = text.replace('**', '').replace('*', '').strip()
 
-    # отделяем эмодзи в начале (могут быть несколько ⚡️ подряд без пробела)
-    m = re.match(r'^((?:⚡️)+)', result)
-    prefix = m.group(1) if m else ""
-    rest = result[len(prefix):].strip()
-
-    # находим конец первого предложения (после .!? с большой буквы дальше, либо первый перенос строки)
-    split_match = re.search(r'(.+?[.!?])(\s|\n|$)', rest, re.DOTALL)
-    if split_match:
-        first_sentence = split_match.group(1).strip()
-        remainder = rest[len(split_match.group(0)):].strip()
+    m = re.search(r'(.+?[.!?])(\s|\n|$)', text, re.DOTALL)
+    if m:
+        first = m.group(1).strip()
+        rest = text[len(m.group(0)):].strip()
     else:
-        # нет точки — берём весь текст до первого переноса строки
-        parts = rest.split("\n", 1)
-        first_sentence = parts[0].strip()
-        remainder = parts[1].strip() if len(parts) > 1 else ""
+        parts = text.split('\n', 1)
+        first = parts[0].strip()
+        rest = parts[1].strip() if len(parts) > 1 else ""
 
-    bolded = f"{prefix}**{first_sentence}**"
-    if remainder:
-        bolded += "\n\n" + remainder
-    return bolded
+    post = f"{emoji}*{first}*"
+    if rest:
+        post += "\n\n" + rest
+    return post
 
 
 def ask_groq(text, importance, length):
@@ -75,27 +70,23 @@ def ask_groq(text, importance, length):
         "Content-Type": "application/json"
     }
     emoji = "⚡️⚡️⚡️" if importance == "важлива" else "⚡️"
-    size = "2-3 речення, дуже стисло" if length == "коротко" else "4-6 речень"
+    size = "2 речення, гранично стисло, лише головний факт" if length == "коротко" else "3-4 речення, без повторів та зайвих деталей"
 
-    prompt = f"""Ти професійний редактор українського новинного Telegram-каналу.
-Перепиши новину нижче українською мовою СУВОРО за цим шаблоном (не відхиляйся від нього):
+    prompt = f"""Ти редактор українського новинного Telegram-каналу. Перепиши новину українською мовою.
 
-{emoji}**Перше речення новини тут, жирним, в подвійних зірочках.**
-
-Другий і наступні абзаци звичайним текстом без зірочок, {size}.
-
-ОБОВ'ЯЗКОВІ ПРАВИЛА:
-- Перше речення ЗАВЖДИ обгорни у ** з обох боків, без винятків
-- Емодзі {emoji} стоїть впритул до жирного тексту, без пробілу
-- Пиши грамотною літературною українською, без калькування з російської
-- НЕ вигадуй фактів
-- НЕ додавай посилання, хештеги, підписи каналу
-- НЕ пиши жодних коментарів від себе — лише сам пост у заданому форматі
+СУВОРІ ПРАВИЛА:
+- {size}
+- НЕ повторюй одну й ту саму думку різними словами в різних реченнях
+- НЕ додавай власних висновків, припущень чи роздумів від себе
+- Пиши лише факти з оригіналу, стисло і по суті
+- Грамотна літературна українська мова, без калькування з російської
+- НЕ став емодзі, зірочки, посилання, хештеги, підписи — це додасться окремо
+- Виведи звичайний текст без жодного форматування, просто чистими реченнями
 
 Оригінальний текст новини:
 {text}
 
-Виведи лише готовий пост у точно такому форматі, як у шаблоні вище."""
+Виведи лише перефразований текст новини, нічого більше."""
 
     body = {
         "model": "llama-3.3-70b-versatile",
@@ -106,9 +97,8 @@ def ask_groq(text, importance, length):
     data = r.json()
     if "choices" not in data:
         raise Exception(str(data))
-    result = data["choices"][0]["message"]["content"].strip()
-    result = ensure_bold_first_sentence(result)
-    return result
+    raw = data["choices"][0]["message"]["content"].strip()
+    return build_post(raw, emoji)
 
 
 async def check_access(update: Update) -> bool:
