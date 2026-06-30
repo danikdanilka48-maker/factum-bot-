@@ -9,10 +9,12 @@ from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, fil
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])  # твой Telegram ID
 CHANNEL_FOOTER = "\n\n[Фактум Новини | Підписатись](https://t.me/factum_ua)"
 
 WAIT_IMPORTANCE, WAIT_LENGTH = range(2)
-user_texts = {}
+# тут храним и текст, и медиа (если есть) для каждого пользователя
+user_data_store = {}
 
 
 class PingHandler(BaseHTTPRequestHandler):
@@ -32,6 +34,8 @@ def run_server():
 
 
 def clean_text(text):
+    if not text:
+        return ""
     text = re.sub(r'\[.*?\]\(https?://\S+\)', '', text)
     text = re.sub(r'https?://\S+', '', text)
     return text.strip()
@@ -75,10 +79,46 @@ def ask_groq(text, importance, length):
     return data["choices"][0]["message"]["content"].strip()
 
 
+async def check_access(update: Update) -> bool:
+    if update.effective_user.id != ALLOWED_USER_ID:
+        await update.message.reply_text("⛔ У вас немає доступу до цього бота.")
+        return False
+    return True
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_texts[update.effective_user.id] = clean_text(update.message.text)
+    if not await check_access(update):
+        return ConversationHandler.END
+
+    msg = update.message
+    # достаём текст: либо обычный текст, либо подпись под фото/видео
+    raw_text = msg.text or msg.caption or ""
+    cleaned = clean_text(raw_text)
+
+    if not cleaned:
+        await msg.reply_text("Не знайшов тексту в повідомленні. Перешліть текст або фото/відео з підписом.")
+        return ConversationHandler.END
+
+    media_type = None
+    media_file_id = None
+    if msg.photo:
+        media_type = "photo"
+        media_file_id = msg.photo[-1].file_id
+    elif msg.video:
+        media_type = "video"
+        media_file_id = msg.video.file_id
+    elif msg.animation:
+        media_type = "animation"
+        media_file_id = msg.animation.file_id
+
+    user_data_store[update.effective_user.id] = {
+        "text": cleaned,
+        "media_type": media_type,
+        "media_file_id": media_file_id,
+    }
+
     keyboard = [["⚡️ Звичайна", "⚡️⚡️⚡️ Важлива"]]
-    await update.message.reply_text(
+    await msg.reply_text(
         "Яка важливість новини?",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
     )
@@ -86,6 +126,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_importance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update):
+        return ConversationHandler.END
+
     context.user_data["importance"] = "важлива" if "Важлива" in update.message.text else "звичайна"
     keyboard = [["📝 Коротко", "📄 Стандартно"]]
     await update.message.reply_text(
@@ -96,14 +139,28 @@ async def handle_importance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_length(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update):
+        return ConversationHandler.END
+
     length = "коротко" if "Коротко" in update.message.text else "стандартно"
     importance = context.user_data.get("importance", "звичайна")
-    text = user_texts.get(update.effective_user.id, "")
+    stored = user_data_store.get(update.effective_user.id, {})
+    text = stored.get("text", "")
+    media_type = stored.get("media_type")
+    media_file_id = stored.get("media_file_id")
 
     await update.message.reply_text("⏳ Форматую...", reply_markup=ReplyKeyboardRemove())
     try:
         result = ask_groq(text, importance, length) + CHANNEL_FOOTER
-        await update.message.reply_text(result, parse_mode="Markdown")
+
+        if media_type == "photo":
+            await update.message.reply_photo(photo=media_file_id, caption=result, parse_mode="Markdown")
+        elif media_type == "video":
+            await update.message.reply_video(video=media_file_id, caption=result, parse_mode="Markdown")
+        elif media_type == "animation":
+            await update.message.reply_animation(animation=media_file_id, caption=result, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(result, parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"Помилка: {e}")
     return ConversationHandler.END
@@ -120,8 +177,16 @@ if __name__ == "__main__":
     asyncio.set_event_loop(loop)
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # принимаем: обычный текст ИЛИ фото/видео/гифку с подписью
+    entry_filter = (
+        (filters.TEXT & ~filters.COMMAND)
+        | filters.PHOTO
+        | filters.VIDEO
+        | filters.ANIMATION
+    )
+
     conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)],
+        entry_points=[MessageHandler(entry_filter, handle_text)],
         states={
             WAIT_IMPORTANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_importance)],
             WAIT_LENGTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_length)],
