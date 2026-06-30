@@ -13,7 +13,6 @@ ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])  # твой Telegram ID
 CHANNEL_FOOTER = "\n\n[Фактум Новини | Підписатись](https://t.me/factum_ua)"
 
 WAIT_IMPORTANCE, WAIT_LENGTH = range(2)
-# тут храним и текст, и медиа (если есть) для каждого пользователя
 user_data_store = {}
 
 
@@ -41,6 +40,34 @@ def clean_text(text):
     return text.strip()
 
 
+def ensure_bold_first_sentence(result: str) -> str:
+    """Подстраховка: если ИИ забыл сделать жирным первое предложение — делаем сами."""
+    result = result.strip()
+    if result.startswith("**"):
+        return result  # уже жирный
+
+    # отделяем эмодзи в начале (могут быть несколько ⚡️ подряд без пробела)
+    m = re.match(r'^((?:⚡️)+)', result)
+    prefix = m.group(1) if m else ""
+    rest = result[len(prefix):].strip()
+
+    # находим конец первого предложения (после .!? с большой буквы дальше, либо первый перенос строки)
+    split_match = re.search(r'(.+?[.!?])(\s|\n|$)', rest, re.DOTALL)
+    if split_match:
+        first_sentence = split_match.group(1).strip()
+        remainder = rest[len(split_match.group(0)):].strip()
+    else:
+        # нет точки — берём весь текст до первого переноса строки
+        parts = rest.split("\n", 1)
+        first_sentence = parts[0].strip()
+        remainder = parts[1].strip() if len(parts) > 1 else ""
+
+    bolded = f"{prefix}**{first_sentence}**"
+    if remainder:
+        bolded += "\n\n" + remainder
+    return bolded
+
+
 def ask_groq(text, importance, length):
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
@@ -50,33 +77,38 @@ def ask_groq(text, importance, length):
     emoji = "⚡️⚡️⚡️" if importance == "важлива" else "⚡️"
     size = "2-3 речення, дуже стисло" if length == "коротко" else "4-6 речень"
 
-    prompt = f"""Ти професійний редактор українського новинного Telegram-каналу. Перепиши новину нижче українською мовою.
+    prompt = f"""Ти професійний редактор українського новинного Telegram-каналу.
+Перепиши новину нижче українською мовою СУВОРО за цим шаблоном (не відхиляйся від нього):
 
-ПРАВИЛА:
-1. Пиши грамотною літературною українською мовою, без помилок та калькування з російської
-2. НЕ вигадуй фактів, які відсутні в оригіналі
-3. НЕ додавай окремий заголовок — одразу пиши перше речення новини
-4. Перше речення зроби жирним, обгорнувши його **подвійними зірочками з обох боків**, наприклад: **Перше речення тут.**
-5. Далі звичайним текстом — решта новини, {size}
-6. На початку, перед жирним текстом, постав {emoji} без пробілу між емодзі та текстом
-7. НЕ додавай посилання, хештеги, підписи каналу — це додасться окремо
-8. Не пиши нічого від себе, ніяких коментарів чи пояснень — лише сам пост
+{emoji}**Перше речення новини тут, жирним, в подвійних зірочках.**
+
+Другий і наступні абзаци звичайним текстом без зірочок, {size}.
+
+ОБОВ'ЯЗКОВІ ПРАВИЛА:
+- Перше речення ЗАВЖДИ обгорни у ** з обох боків, без винятків
+- Емодзі {emoji} стоїть впритул до жирного тексту, без пробілу
+- Пиши грамотною літературною українською, без калькування з російської
+- НЕ вигадуй фактів
+- НЕ додавай посилання, хештеги, підписи каналу
+- НЕ пиши жодних коментарів від себе — лише сам пост у заданому форматі
 
 Оригінальний текст новини:
 {text}
 
-Виведи лише готовий пост."""
+Виведи лише готовий пост у точно такому форматі, як у шаблоні вище."""
 
     body = {
         "model": "llama-3.3-70b-versatile",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3
+        "temperature": 0.2
     }
     r = requests.post(url, headers=headers, json=body, timeout=30)
     data = r.json()
     if "choices" not in data:
         raise Exception(str(data))
-    return data["choices"][0]["message"]["content"].strip()
+    result = data["choices"][0]["message"]["content"].strip()
+    result = ensure_bold_first_sentence(result)
+    return result
 
 
 async def check_access(update: Update) -> bool:
@@ -91,7 +123,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     msg = update.message
-    # достаём текст: либо обычный текст, либо подпись под фото/видео
     raw_text = msg.text or msg.caption or ""
     cleaned = clean_text(raw_text)
 
@@ -177,7 +208,6 @@ if __name__ == "__main__":
     asyncio.set_event_loop(loop)
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # принимаем: обычный текст ИЛИ фото/видео/гифку с подписью
     entry_filter = (
         (filters.TEXT & ~filters.COMMAND)
         | filters.PHOTO
