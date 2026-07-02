@@ -4,15 +4,15 @@ import requests
 import asyncio
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes, ConversationHandler
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
 CHANNEL_FOOTER = "\n\n[Фактум Новини | Підписатись](https://t.me/factum_ua)"
 
-WAIT_IMPORTANCE, WAIT_LENGTH = range(2)
+WAIT_IMPORTANCE = 0
 user_data_store = {}
 
 
@@ -41,9 +41,6 @@ def clean_text(text):
 
 
 def build_post(raw_ai_text: str, emoji: str) -> str:
-    """Берёт чистый текст от ИИ (без эмодзи и звёздочек), делает первое
-    предложение жирным через одинарные * (старый Markdown) и добавляет
-    пустую строку-отступ перед остальным текстом."""
     text = raw_ai_text.strip()
     text = re.sub(r'^(⚡️)+', '', text).strip()
     text = text.replace('**', '').replace('*', '').strip()
@@ -63,35 +60,35 @@ def build_post(raw_ai_text: str, emoji: str) -> str:
     return post
 
 
-def ask_groq(text, importance, length):
+def ask_groq(text, importance):
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
     emoji = "⚡️⚡️⚡️" if importance == "важлива" else "⚡️"
-    size = "2 речення, гранично стисло, лише головний факт" if length == "коротко" else "3-4 речення, без повторів та зайвих деталей"
 
-    prompt = f"""Ти редактор українського новинного Telegram-каналу. Перепиши новину українською мовою.
+    prompt = f"""Ти — досвідчений редактор українського новинного Telegram-каналу.
 
-СУВОРІ ПРАВИЛА:
-- {size}
-- НЕ повторюй одну й ту саму думку різними словами в різних реченнях
-- НЕ додавай власних висновків, припущень чи роздумів від себе
-- Пиши лише факти з оригіналу, стисло і по суті
-- Грамотна літературна українська мова, без калькування з російської
-- НЕ став емодзі, зірочки, посилання, хештеги, підписи — це додасться окремо
-- Виведи звичайний текст без жодного форматування, просто чистими реченнями
+Перепиши новину українською мовою. СУВОРІ ПРАВИЛА:
 
-Оригінальний текст новини:
+1. МОВА: Бездоганна літературна українська мова. Жодних граматичних, орфографічних або пунктуаційних помилок. Жодного калькування з російської (наприклад, НЕ "відмічено" а "зафіксовано", НЕ "приймати участь" а "брати участь").
+
+2. СТИЛЬ: Стисло, чітко, по суті. Оптимальна довжина — 2-4 речення залежно від важливості події. Не повторюй одну думку різними словами. Не додавай власних висновків і припущень.
+
+3. ФАКТИ: Лише те, що є в оригіналі. Нічого від себе.
+
+4. ФОРМАТ: Виведи лише чистий текст без зірочок, емодзі, посилань, хештегів і підписів — це буде додано окремо.
+
+Оригінальний текст:
 {text}
 
-Виведи лише перефразований текст новини, нічого більше."""
+Виведи лише перефразований текст."""
 
     body = {
         "model": "llama-3.3-70b-versatile",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2
+        "temperature": 0.15
     }
     r = requests.post(url, headers=headers, json=body, timeout=30)
     data = r.json()
@@ -102,8 +99,10 @@ def ask_groq(text, importance, length):
 
 
 async def check_access(update: Update) -> bool:
-    if update.effective_user.id != ALLOWED_USER_ID:
-        await update.message.reply_text("⛔ У вас немає доступу до цього бота.")
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id != ALLOWED_USER_ID:
+        if update.message:
+            await update.message.reply_text("⛔ У вас немає доступу до цього бота.")
         return False
     return True
 
@@ -117,7 +116,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cleaned = clean_text(raw_text)
 
     if not cleaned:
-        await msg.reply_text("Не знайшов тексту в повідомленні. Перешліть текст або фото/відео з підписом.")
+        await msg.reply_text("Не знайшов тексту. Перешліть текст або фото/відео з підписом.")
         return ConversationHandler.END
 
     media_type = None
@@ -150,21 +149,8 @@ async def handle_importance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_access(update):
         return ConversationHandler.END
 
-    context.user_data["importance"] = "важлива" if "Важлива" in update.message.text else "звичайна"
-    keyboard = [["📝 Коротко", "📄 Стандартно"]]
-    await update.message.reply_text(
-        "Який розмір посту?",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-    )
-    return WAIT_LENGTH
-
-
-async def handle_length(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_access(update):
-        return ConversationHandler.END
-
-    length = "коротко" if "Коротко" in update.message.text else "стандартно"
-    importance = context.user_data.get("importance", "звичайна")
+    importance = "важлива" if "Важлива" in update.message.text else "звичайна"
+    context.user_data["importance"] = importance
     stored = user_data_store.get(update.effective_user.id, {})
     text = stored.get("text", "")
     media_type = stored.get("media_type")
@@ -172,19 +158,56 @@ async def handle_length(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("⏳ Форматую...", reply_markup=ReplyKeyboardRemove())
     try:
-        result = ask_groq(text, importance, length) + CHANNEL_FOOTER
+        result = ask_groq(text, importance) + CHANNEL_FOOTER
+        context.user_data["last_result"] = result
+        context.user_data["last_media_type"] = media_type
+        context.user_data["last_media_file_id"] = media_file_id
+
+        retry_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Переробити", callback_data="retry")]])
 
         if media_type == "photo":
-            await update.message.reply_photo(photo=media_file_id, caption=result, parse_mode="Markdown")
+            await update.message.reply_photo(photo=media_file_id, caption=result, parse_mode="Markdown", reply_markup=retry_btn)
         elif media_type == "video":
-            await update.message.reply_video(video=media_file_id, caption=result, parse_mode="Markdown")
+            await update.message.reply_video(video=media_file_id, caption=result, parse_mode="Markdown", reply_markup=retry_btn)
         elif media_type == "animation":
-            await update.message.reply_animation(animation=media_file_id, caption=result, parse_mode="Markdown")
+            await update.message.reply_animation(animation=media_file_id, caption=result, parse_mode="Markdown", reply_markup=retry_btn)
         else:
-            await update.message.reply_text(result, parse_mode="Markdown")
+            await update.message.reply_text(result, parse_mode="Markdown", reply_markup=retry_btn)
     except Exception as e:
         await update.message.reply_text(f"Помилка: {e}")
     return ConversationHandler.END
+
+
+async def handle_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not await check_access(update):
+        return
+
+    stored = user_data_store.get(update.effective_user.id, {})
+    text = stored.get("text", "")
+    importance = context.user_data.get("importance", "звичайна")
+    media_type = context.user_data.get("last_media_type")
+    media_file_id = context.user_data.get("last_media_file_id")
+
+    await query.message.reply_text("⏳ Переробляю...")
+    try:
+        result = ask_groq(text, importance) + CHANNEL_FOOTER
+        context.user_data["last_result"] = result
+
+        retry_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Переробити", callback_data="retry")]])
+
+        if media_type == "photo":
+            await query.message.reply_photo(photo=media_file_id, caption=result, parse_mode="Markdown", reply_markup=retry_btn)
+        elif media_type == "video":
+            await query.message.reply_video(video=media_file_id, caption=result, parse_mode="Markdown", reply_markup=retry_btn)
+        elif media_type == "animation":
+            await query.message.reply_animation(animation=media_file_id, caption=result, parse_mode="Markdown", reply_markup=retry_btn)
+        else:
+            await query.message.reply_text(result, parse_mode="Markdown", reply_markup=retry_btn)
+    except Exception as e:
+        await query.message.reply_text(f"Помилка: {e}")
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -209,10 +232,10 @@ if __name__ == "__main__":
         entry_points=[MessageHandler(entry_filter, handle_text)],
         states={
             WAIT_IMPORTANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_importance)],
-            WAIT_LENGTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_length)],
         },
         fallbacks=[CommandHandler("cancel", cancel)]
     )
     app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(handle_retry, pattern="^retry$"))
     print("Бот запущено")
     app.run_polling()
