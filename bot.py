@@ -14,10 +14,8 @@ CHANNEL_FOOTER = "\n\n[Фактум Новини | Підписатись](https
 
 WAIT_IMPORTANCE = 0
 user_data_store = {}
-# для збору медіагруп: media_group_id -> список file_id та тип
 media_group_buffer = {}
 media_group_text = {}
-media_group_timers = {}
 
 
 class PingHandler(BaseHTTPRequestHandler):
@@ -25,7 +23,6 @@ class PingHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
-
     def log_message(self, format, *args):
         pass
 
@@ -48,7 +45,6 @@ def build_post(raw_ai_text: str, emoji: str) -> str:
     text = raw_ai_text.strip()
     text = re.sub(r'^(⚡️)+', '', text).strip()
     text = text.replace('**', '').replace('*', '').strip()
-
     m = re.search(r'(.+?[.!?])(\s|\n|$)', text, re.DOTALL)
     if m:
         first = m.group(1).strip()
@@ -57,7 +53,6 @@ def build_post(raw_ai_text: str, emoji: str) -> str:
         parts = text.split('\n', 1)
         first = parts[0].strip()
         rest = parts[1].strip() if len(parts) > 1 else ""
-
     post = f"{emoji}*{first}*"
     if rest:
         post += "\n\n" + rest
@@ -66,44 +61,35 @@ def build_post(raw_ai_text: str, emoji: str) -> str:
 
 def ask_groq(text, importance, temperature=0.15):
     url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     emoji = "⚡️⚡️⚡️" if importance == "важлива" else "⚡️"
-
     prompt = f"""Ти — досвідчений редактор українського новинного Telegram-каналу.
 
 Перепиши новину українською мовою. СУВОРІ ПРАВИЛА:
 
 1. МОВА — бездоганна українська:
    - Ніяких граматичних, орфографічних або пунктуаційних помилок
-   - НЕ калькуй з російської: пиши "зафіксовано" (не "відмічено"), "брати участь" (не "приймати участь"), "через" (не "у зв'язку з")
+   - НЕ калькуй з російської: "зафіксовано" (не "відмічено"), "брати участь" (не "приймати участь")
    - Правильні відмінки, узгодження, розділові знаки
 
-2. БЕЗ ПОВТОРІВ — найважливіше:
-   - Кожне речення повинно містити НОВУ інформацію
-   - Категорично заборонено переказувати ту саму думку іншими словами
-   - Краще одне чітке речення, ніж три з однаковим змістом
+2. БЕЗ ПОВТОРІВ:
+   - Кожне речення містить НОВУ інформацію
+   - Заборонено переказувати ту саму думку іншими словами
+   - Краще одне чітке речення ніж три з однаковим змістом
 
 3. СТИЛЬ:
-   - Стисло і по суті: 1-3 речення залежно від кількості фактів
+   - 1-3 речення залежно від кількості фактів
    - Лише факти з оригіналу, нічого від себе
-   - Без власних висновків і припущень
+   - Без висновків і припущень
 
-4. ФОРМАТ:
-   - Виведи лише чистий текст без зірочок, емодзі, посилань, хештегів
+4. Виведи лише чистий текст без зірочок, емодзі, посилань, хештегів
 
 Оригінальний текст:
 {text}
 
-Виведи лише перефразований текст без повторів."""
+Виведи лише перефразований текст."""
 
-    body = {
-        "model": "llama-3.3-70b-versatile",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": temperature
-    }
+    body = {"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}], "temperature": temperature}
     r = requests.post(url, headers=headers, json=body, timeout=30)
     data = r.json()
     if "choices" not in data:
@@ -112,17 +98,19 @@ def ask_groq(text, importance, temperature=0.15):
     return build_post(raw, emoji)
 
 
-def get_retry_keyboard():
+def get_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Переробити", callback_data="retry")],
         [InlineKeyboardButton("✏️ Є помилка — виправити", callback_data="fix")]
     ])
 
 
-async def send_result(bot, chat_id, result, media_list, media_type, media_file_id, kb):
-    """Відправляє результат — одне медіа або групу медіа."""
+async def send_result(bot, chat_id, result, stored, kb):
+    media_list = stored.get("media_list", [])
+    media_type = stored.get("media_type")
+    media_file_id = stored.get("media_file_id")
+
     if media_list and len(media_list) > 1:
-        # медіагрупа — перше з підписом, решта без
         input_media = []
         for i, (ftype, fid) in enumerate(media_list):
             caption = result if i == 0 else None
@@ -132,8 +120,7 @@ async def send_result(bot, chat_id, result, media_list, media_type, media_file_i
             elif ftype == "video":
                 input_media.append(InputMediaVideo(media=fid, caption=caption, parse_mode=parse_mode))
         await bot.send_media_group(chat_id=chat_id, media=input_media)
-        # кнопки окремо після групи
-        await bot.send_message(chat_id=chat_id, text="👆 Готово! Що далі?", reply_markup=kb)
+        await bot.send_message(chat_id=chat_id, text="👆 Готово!", reply_markup=kb)
     elif media_type == "photo":
         await bot.send_photo(chat_id=chat_id, photo=media_file_id, caption=result, parse_mode="Markdown", reply_markup=kb)
     elif media_type == "video":
@@ -153,67 +140,17 @@ async def check_access(update: Update) -> bool:
     return True
 
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_access(update):
         return ConversationHandler.END
 
     msg = update.message
+
+    # текст із повідомлення або підпис під медіа
     raw_text = msg.text or msg.caption or ""
     cleaned = clean_text(raw_text)
 
-    # обробка медіагрупи
-    if msg.media_group_id:
-        group_id = msg.media_group_id
-        if group_id not in media_group_buffer:
-            media_group_buffer[group_id] = []
-            media_group_text[group_id] = cleaned or ""
-
-        if msg.photo:
-            media_group_buffer[group_id].append(("photo", msg.photo[-1].file_id))
-        elif msg.video:
-            media_group_buffer[group_id].append(("video", msg.video.file_id))
-
-        if not media_group_text[group_id] and cleaned:
-            media_group_text[group_id] = cleaned
-
-        # скасовуємо попередній таймер якщо є
-        if group_id in media_group_timers:
-            media_group_timers[group_id].cancel()
-
-        # чекаємо 1.5 секунди щоб зібрати всі фото з групи
-        async def process_group():
-            await asyncio.sleep(1.5)
-            files = media_group_buffer.pop(group_id, [])
-            text = media_group_text.pop(group_id, "")
-            media_group_timers.pop(group_id, None)
-
-            if not text:
-                await context.bot.send_message(chat_id=msg.chat_id, text="Не знайшов тексту. Перешліть фото/відео з підписом.")
-                return
-
-            user_data_store[update.effective_user.id] = {
-                "text": text,
-                "media_list": files,
-                "media_type": files[0][0] if files else None,
-                "media_file_id": files[0][1] if files else None,
-            }
-
-            keyboard = [["⚡️ Звичайна", "⚡️⚡️⚡️ Важлива"]]
-            await context.bot.send_message(
-                chat_id=msg.chat_id,
-                text=f"Зібрав {len(files)} медіафайлів. Яка важливість новини?",
-                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-            )
-
-        task = asyncio.ensure_future(process_group())
-        media_group_timers[group_id] = task
-        return WAIT_IMPORTANCE
-
-    # одне повідомлення (не група)
-    if not cleaned:
-        await msg.reply_text("Не знайшов тексту. Перешліть текст або фото/відео з підписом.")
-        return ConversationHandler.END
-
+    # визначаємо медіа
     media_type = None
     media_file_id = None
     if msg.photo:
@@ -225,6 +162,49 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif msg.animation:
         media_type = "animation"
         media_file_id = msg.animation.file_id
+
+    # якщо це частина медіагрупи
+    if msg.media_group_id and media_type in ("photo", "video"):
+        group_id = msg.media_group_id
+        if group_id not in media_group_buffer:
+            media_group_buffer[group_id] = []
+            media_group_text[group_id] = ""
+        media_group_buffer[group_id].append((media_type, media_file_id))
+        if cleaned:
+            media_group_text[group_id] = cleaned
+
+        # чекаємо поки всі фото прийдуть (через 1.5с після останнього)
+        async def finalize_group():
+            await asyncio.sleep(1.5)
+            if group_id not in media_group_buffer:
+                return
+            files = media_group_buffer.pop(group_id, [])
+            text = media_group_text.pop(group_id, "")
+
+            if not text:
+                await context.bot.send_message(chat_id=msg.chat_id, text="Не знайшов тексту. Перешліть фото/відео з підписом.")
+                return
+
+            user_data_store[update.effective_user.id] = {
+                "text": text,
+                "media_list": files,
+                "media_type": files[0][0] if files else None,
+                "media_file_id": files[0][1] if files else None,
+            }
+            keyboard = [["⚡️ Звичайна", "⚡️⚡️⚡️ Важлива"]]
+            await context.bot.send_message(
+                chat_id=msg.chat_id,
+                text=f"Зібрав {len(files)} файлів. Яка важливість новини?",
+                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+            )
+
+        asyncio.ensure_future(finalize_group())
+        return WAIT_IMPORTANCE
+
+    # звичайне одне повідомлення
+    if not cleaned:
+        await msg.reply_text("Не знайшов тексту. Перешліть текст або фото/відео з підписом.")
+        return ConversationHandler.END
 
     user_data_store[update.effective_user.id] = {
         "text": cleaned,
@@ -249,20 +229,13 @@ async def handle_importance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["importance"] = importance
     stored = user_data_store.get(update.effective_user.id, {})
     text = stored.get("text", "")
-    media_list = stored.get("media_list", [])
-    media_type = stored.get("media_type")
-    media_file_id = stored.get("media_file_id")
 
     await update.message.reply_text("⏳ Форматую...", reply_markup=ReplyKeyboardRemove())
     try:
-        result = ask_groq(text, importance, temperature=0.15) + CHANNEL_FOOTER
+        result = ask_groq(text, importance) + CHANNEL_FOOTER
         context.user_data["last_result"] = result
-        context.user_data["last_media_list"] = media_list
-        context.user_data["last_media_type"] = media_type
-        context.user_data["last_media_file_id"] = media_file_id
-
-        kb = get_retry_keyboard()
-        await send_result(context.bot, update.message.chat_id, result, media_list, media_type, media_file_id, kb)
+        context.user_data["last_stored"] = stored
+        await send_result(context.bot, update.message.chat_id, result, stored, get_keyboard())
     except Exception as e:
         await update.message.reply_text(f"Помилка: {e}")
     return ConversationHandler.END
@@ -273,20 +246,14 @@ async def handle_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if not await check_access(update):
         return
-
     stored = user_data_store.get(update.effective_user.id, {})
     text = stored.get("text", "")
     importance = context.user_data.get("importance", "звичайна")
-    media_list = context.user_data.get("last_media_list", [])
-    media_type = context.user_data.get("last_media_type")
-    media_file_id = context.user_data.get("last_media_file_id")
-
     await query.message.reply_text("⏳ Переробляю...")
     try:
         result = ask_groq(text, importance, temperature=0.7) + CHANNEL_FOOTER
         context.user_data["last_result"] = result
-        kb = get_retry_keyboard()
-        await send_result(context.bot, query.message.chat_id, result, media_list, media_type, media_file_id, kb)
+        await send_result(context.bot, query.message.chat_id, result, stored, get_keyboard())
     except Exception as e:
         await query.message.reply_text(f"Помилка: {e}")
 
@@ -296,41 +263,29 @@ async def handle_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if not await check_access(update):
         return
-
+    stored = user_data_store.get(update.effective_user.id, {})
     importance = context.user_data.get("importance", "звичайна")
-    media_list = context.user_data.get("last_media_list", [])
-    media_type = context.user_data.get("last_media_type")
-    media_file_id = context.user_data.get("last_media_file_id")
     last_result = context.user_data.get("last_result", "")
+    clean_result = last_result.replace(CHANNEL_FOOTER, "").replace("*", "").strip()
 
-    await query.message.reply_text("✏️ Перевіряю та виправляю помилки...")
+    await query.message.reply_text("✏️ Виправляю помилки...")
     try:
-        clean_result = last_result.replace(CHANNEL_FOOTER, "").replace("*", "").strip()
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-        fix_prompt = f"""Ти — коректор українського тексту. Виправ ВСІ помилки:
-- Граматичні, орфографічні, пунктуаційні помилки
-- Кальки з російської мови
-- Повтори думок
-
-Поверни лише виправлений текст без пояснень, без зірочок, без емодзі.
+        fix_prompt = f"""Ти — коректор українського тексту. Виправ ВСІ помилки (граматичні, орфографічні, пунктуаційні, кальки з російської, повтори думок). Поверни лише виправлений текст без пояснень, зірочок, емодзі.
 
 Текст:
 {clean_result}"""
-
         body = {"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": fix_prompt}], "temperature": 0.1}
         r = requests.post(url, headers=headers, json=body, timeout=30)
         data = r.json()
         if "choices" not in data:
             raise Exception(str(data))
-
         emoji = "⚡️⚡️⚡️" if importance == "важлива" else "⚡️"
         raw = data["choices"][0]["message"]["content"].strip()
         result = build_post(raw, emoji) + CHANNEL_FOOTER
         context.user_data["last_result"] = result
-
-        kb = get_retry_keyboard()
-        await send_result(context.bot, query.message.chat_id, result, media_list, media_type, media_file_id, kb)
+        await send_result(context.bot, query.message.chat_id, result, stored, get_keyboard())
     except Exception as e:
         await query.message.reply_text(f"Помилка: {e}")
 
@@ -354,7 +309,7 @@ if __name__ == "__main__":
     )
 
     conv = ConversationHandler(
-        entry_points=[MessageHandler(entry_filter, handle_text)],
+        entry_points=[MessageHandler(entry_filter, handle_message)],
         states={
             WAIT_IMPORTANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_importance)],
         },
