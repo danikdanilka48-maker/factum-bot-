@@ -60,7 +60,7 @@ def build_post(raw_ai_text: str, emoji: str) -> str:
     return post
 
 
-def ask_groq(text, importance):
+def ask_groq(text, importance, temperature=0.15):
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -72,23 +72,34 @@ def ask_groq(text, importance):
 
 Перепиши новину українською мовою. СУВОРІ ПРАВИЛА:
 
-1. МОВА: Бездоганна літературна українська мова. Жодних граматичних, орфографічних або пунктуаційних помилок. Жодного калькування з російської (наприклад, НЕ "відмічено" а "зафіксовано", НЕ "приймати участь" а "брати участь").
+1. МОВА — бездоганна українська:
+   - Ніяких граматичних, орфографічних або пунктуаційних помилок
+   - НЕ калькуй з російської: пиши "зафіксовано" (не "відмічено"), "брати участь" (не "приймати участь"), "через" (не "у зв'язку з"), "відбулося" (не "произошло")
+   - Правильні відмінки, узгодження, розділові знаки
 
-2. СТИЛЬ: Стисло, чітко, по суті. Оптимальна довжина — 2-4 речення залежно від важливості події. Не повторюй одну думку різними словами. Не додавай власних висновків і припущень.
+2. БЕЗ ПОВТОРІВ — це найважливіше:
+   - Кожне речення повинно містити НОВУ інформацію
+   - Категорично заборонено переказувати ту саму думку іншими словами
+   - Якщо факт вже згаданий — НЕ повторюй його знову
+   - Краще одне чітке речення, ніж три з однаковим змістом
 
-3. ФАКТИ: Лише те, що є в оригіналі. Нічого від себе.
+3. СТИЛЬ:
+   - Стисло і по суті: 1-3 речення залежно від кількості фактів
+   - Лише факти з оригіналу, нічого від себе
+   - Без власних висновків і припущень
 
-4. ФОРМАТ: Виведи лише чистий текст без зірочок, емодзі, посилань, хештегів і підписів — це буде додано окремо.
+4. ФОРМАТ:
+   - Виведи лише чистий текст без зірочок, емодзі, посилань, хештегів
 
 Оригінальний текст:
 {text}
 
-Виведи лише перефразований текст."""
+Виведи лише перефразований текст без повторів."""
 
     body = {
         "model": "llama-3.3-70b-versatile",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.15
+        "temperature": temperature
     }
     r = requests.post(url, headers=headers, json=body, timeout=30)
     data = r.json()
@@ -96,6 +107,13 @@ def ask_groq(text, importance):
         raise Exception(str(data))
     raw = data["choices"][0]["message"]["content"].strip()
     return build_post(raw, emoji)
+
+
+def get_retry_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Переробити", callback_data="retry")],
+        [InlineKeyboardButton("✏️ Є помилка — виправити", callback_data="fix")]
+    ])
 
 
 async def check_access(update: Update) -> bool:
@@ -158,21 +176,20 @@ async def handle_importance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("⏳ Форматую...", reply_markup=ReplyKeyboardRemove())
     try:
-        result = ask_groq(text, importance) + CHANNEL_FOOTER
+        result = ask_groq(text, importance, temperature=0.15) + CHANNEL_FOOTER
         context.user_data["last_result"] = result
         context.user_data["last_media_type"] = media_type
         context.user_data["last_media_file_id"] = media_file_id
 
-        retry_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Переробити", callback_data="retry")]])
-
+        kb = get_retry_keyboard()
         if media_type == "photo":
-            await update.message.reply_photo(photo=media_file_id, caption=result, parse_mode="Markdown", reply_markup=retry_btn)
+            await update.message.reply_photo(photo=media_file_id, caption=result, parse_mode="Markdown", reply_markup=kb)
         elif media_type == "video":
-            await update.message.reply_video(video=media_file_id, caption=result, parse_mode="Markdown", reply_markup=retry_btn)
+            await update.message.reply_video(video=media_file_id, caption=result, parse_mode="Markdown", reply_markup=kb)
         elif media_type == "animation":
-            await update.message.reply_animation(animation=media_file_id, caption=result, parse_mode="Markdown", reply_markup=retry_btn)
+            await update.message.reply_animation(animation=media_file_id, caption=result, parse_mode="Markdown", reply_markup=kb)
         else:
-            await update.message.reply_text(result, parse_mode="Markdown", reply_markup=retry_btn)
+            await update.message.reply_text(result, parse_mode="Markdown", reply_markup=kb)
     except Exception as e:
         await update.message.reply_text(f"Помилка: {e}")
     return ConversationHandler.END
@@ -181,7 +198,6 @@ async def handle_importance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if not await check_access(update):
         return
 
@@ -193,19 +209,82 @@ async def handle_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.message.reply_text("⏳ Переробляю...")
     try:
-        result = ask_groq(text, importance) + CHANNEL_FOOTER
+        # підвищуємо температуру щоб отримати інший варіант
+        result = ask_groq(text, importance, temperature=0.7) + CHANNEL_FOOTER
         context.user_data["last_result"] = result
 
-        retry_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Переробити", callback_data="retry")]])
-
+        kb = get_retry_keyboard()
         if media_type == "photo":
-            await query.message.reply_photo(photo=media_file_id, caption=result, parse_mode="Markdown", reply_markup=retry_btn)
+            await query.message.reply_photo(photo=media_file_id, caption=result, parse_mode="Markdown", reply_markup=kb)
         elif media_type == "video":
-            await query.message.reply_video(video=media_file_id, caption=result, parse_mode="Markdown", reply_markup=retry_btn)
+            await query.message.reply_video(video=media_file_id, caption=result, parse_mode="Markdown", reply_markup=kb)
         elif media_type == "animation":
-            await query.message.reply_animation(animation=media_file_id, caption=result, parse_mode="Markdown", reply_markup=retry_btn)
+            await query.message.reply_animation(animation=media_file_id, caption=result, parse_mode="Markdown", reply_markup=kb)
         else:
-            await query.message.reply_text(result, parse_mode="Markdown", reply_markup=retry_btn)
+            await query.message.reply_text(result, parse_mode="Markdown", reply_markup=kb)
+    except Exception as e:
+        await query.message.reply_text(f"Помилка: {e}")
+
+
+async def handle_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await check_access(update):
+        return
+
+    stored = user_data_store.get(update.effective_user.id, {})
+    text = stored.get("text", "")
+    importance = context.user_data.get("importance", "звичайна")
+    media_type = context.user_data.get("last_media_type")
+    media_file_id = context.user_data.get("last_media_file_id")
+    last_result = context.user_data.get("last_result", "")
+
+    await query.message.reply_text("✏️ Перевіряю та виправляю помилки...")
+    try:
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        # прибираємо footer і форматування перед перевіркою
+        clean_result = last_result.replace(CHANNEL_FOOTER, "").replace("*", "").strip()
+
+        fix_prompt = f"""Ти — коректор українського тексту. Перевір текст нижче і виправ ВСІ помилки:
+- Граматичні помилки
+- Орфографічні помилки  
+- Пунктуаційні помилки
+- Кальки з російської мови
+- Повтори думок
+
+Поверни лише виправлений текст без пояснень, без зірочок, без емодзі.
+
+Текст для перевірки:
+{clean_result}"""
+
+        body = {
+            "model": "llama-3.3-70b-versatile",
+            "messages": [{"role": "user", "content": fix_prompt}],
+            "temperature": 0.1
+        }
+        r = requests.post(url, headers=headers, json=body, timeout=30)
+        data = r.json()
+        if "choices" not in data:
+            raise Exception(str(data))
+
+        emoji = "⚡️⚡️⚡️" if importance == "важлива" else "⚡️"
+        raw = data["choices"][0]["message"]["content"].strip()
+        result = build_post(raw, emoji) + CHANNEL_FOOTER
+        context.user_data["last_result"] = result
+
+        kb = get_retry_keyboard()
+        if media_type == "photo":
+            await query.message.reply_photo(photo=media_file_id, caption=result, parse_mode="Markdown", reply_markup=kb)
+        elif media_type == "video":
+            await query.message.reply_video(video=media_file_id, caption=result, parse_mode="Markdown", reply_markup=kb)
+        elif media_type == "animation":
+            await query.message.reply_animation(animation=media_file_id, caption=result, parse_mode="Markdown", reply_markup=kb)
+        else:
+            await query.message.reply_text(result, parse_mode="Markdown", reply_markup=kb)
     except Exception as e:
         await query.message.reply_text(f"Помилка: {e}")
 
@@ -237,5 +316,6 @@ if __name__ == "__main__":
     )
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(handle_retry, pattern="^retry$"))
+    app.add_handler(CallbackQueryHandler(handle_fix, pattern="^fix$"))
     print("Бот запущено")
     app.run_polling()
