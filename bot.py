@@ -91,7 +91,7 @@ def ask_groq(text, importance, temperature=0.15):
 Виведи лише перефразований текст без повторів."""
 
     body = {
-        "model": "llama-3.3-70b-versatile",
+        "model": "openai/gpt-oss-120b",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": temperature
     }
