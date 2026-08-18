@@ -244,7 +244,7 @@ async def handle_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Текст:
 {clean_result}"""
-        body = {"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": fix_prompt}], "temperature": 0.1}
+        body = {"model": "openai/gpt-oss-120b", "messages": [{"role": "user", "content": fix_prompt}], "temperature": 0.1}
         r = requests.post(url, headers=headers, json=body, timeout=30)
         data = r.json()
         if "choices" not in data:
