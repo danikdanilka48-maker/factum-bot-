@@ -69,7 +69,7 @@ def ask_groq(text, importance, temperature=0.15):
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     emoji = "⚡️⚡️⚡️" if importance == "важлива" else "⚡️"
 
-          prompt = f"""Ти — редактор українського новинного Telegram-каналу.
+    prompt = f"""Ти — редактор українського новинного Telegram-каналу.
 
 Твоє завдання:
 1. Перефразуй новину українською мовою — стисло, чітко, журналістським стилем. ОБОВ'ЯЗКОВО зроби перший рядок жирним: **Перший рядок тут**. Далі з нового рядка — основний текст.
