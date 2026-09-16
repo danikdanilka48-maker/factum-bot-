@@ -23,9 +23,9 @@ from telegram.ext import (
     ConversationHandler,
 )
 
-BOT_TOKEN = os.environ["8725816044:AAGxSuxhQFYo1hm1DY84-hGZXbstGjR-xuM"]
-GROQ_API_KEY = os.environ["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"]
-ALLOWED_USER_ID = int(os.environ["7789913799"])
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
 # ID або @username каналу для публікації. Бот повинен бути адміном
 # цього каналу з правом надсилати повідомлення.
 CHANNEL_ID = os.environ["CHANNEL_ID"]
@@ -424,3 +424,4 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(handle_fix, pattern="^fix$"))
     print("Бот запущено")
     app.run_polling()
+    
