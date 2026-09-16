@@ -39,6 +39,17 @@ user_data_store = {}
 ALBUM_WAIT_SECONDS = 1.5
 media_group_buffers = {}  # media_group_id -> [Message, ...]
 
+# Список моделей Groq у порядку пріоритету. Якщо на поточній моделі
+# закінчився денний ліміт токенів (rate_limit_exceeded) або сталася
+# інша помилка — код автоматично пробує наступну модель зі списку.
+# За потреби можна змінити порядок або додати/прибрати моделі.
+GROQ_MODELS = [
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+]
+
 
 class PingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -88,13 +99,40 @@ def build_post(raw_ai_text: str, emoji: str) -> str:
     return post
 
 
-def ask_groq(text, importance, temperature=0.15):
+def call_groq(messages, temperature=0.15, timeout=30):
+    """Викликати Groq chat completion, перебираючи моделі зі списку
+    GROQ_MODELS по черзі. Якщо модель впирається в ліміт токенів
+    (rate_limit_exceeded) чи повертає іншу помилку — пробуємо наступну
+    модель зі списку. Якщо жодна модель не спрацювала — кидаємо
+    останню отриману помилку."""
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+
+    last_error = None
+    for model in GROQ_MODELS:
+        body = {"model": model, "messages": messages, "temperature": temperature}
+        try:
+            r = requests.post(url, headers=headers, json=body, timeout=timeout)
+            data = r.json()
+        except Exception as e:
+            last_error = e
+            continue
+
+        if "choices" in data:
+            return data["choices"][0]["message"]["content"].strip()
+
+        # Помилка від Groq (ліміт токенів, недоступна модель тощо) —
+        # запам'ятовуємо і переходимо до наступної моделі зі списку.
+        last_error = Exception(f"{model}: {data}")
+        continue
+
+    raise last_error if last_error else Exception("Усі моделі Groq недоступні")
+
+
+def ask_groq(text, importance, temperature=0.15):
     emoji = "⚡️⚡️⚡️" if importance == "важлива" else "⚡️"
 
     prompt = f"""Ти — редактор українського новинного Telegram-каналу.
-
 
 Твоє завдання:
 1. Перефразуй новину українською мовою — стисло, чітко, журналістським стилем. ОБОВ'ЯЗКОВО зроби перший рядок жирним: Перший рядок тут. Далі з нового рядка — основний текст.
@@ -113,16 +151,7 @@ def ask_groq(text, importance, temperature=0.15):
 Текст новини:
 {text}"""
 
-    body = {
-        "model": "openai/gpt-oss-120b",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": temperature
-    }
-    r = requests.post(url, headers=headers, json=body, timeout=30)
-    data = r.json()
-    if "choices" not in data:
-        raise Exception(str(data))
-    raw = data["choices"][0]["message"]["content"].strip()
+    raw = call_groq([{"role": "user", "content": prompt}], temperature=temperature)
     return build_post(raw, emoji)
 
 
@@ -340,8 +369,6 @@ async def handle_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.message.reply_text("✏️ Виправляю помилки...")
     try:
-        url = "https://api.groq.com/openai/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
         fix_prompt = f"""Ти — коректор українського тексту. Виправ ВСІ помилки:
 - Граматичні, орфографічні, пунктуаційні помилки
 - Кальки з російської мови
@@ -351,14 +378,9 @@ async def handle_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Текст:
 {clean_result}"""
-        body = {"model": "openai/gpt-oss-120b", "messages": [{"role": "user", "content": fix_prompt}], "temperature": 0.1}
-        r = requests.post(url, headers=headers, json=body, timeout=30)
-        data = r.json()
-        if "choices" not in data:
-            raise Exception(str(data))
+        raw = call_groq([{"role": "user", "content": fix_prompt}], temperature=0.1)
 
         emoji = "⚡️⚡️⚡️" if importance == "важлива" else "⚡️"
-        raw = data["choices"][0]["message"]["content"].strip()
         result = build_post(raw, emoji) + CHANNEL_FOOTER
         context.user_data["last_result"] = result
 
@@ -424,4 +446,3 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(handle_fix, pattern="^fix$"))
     print("Бот запущено")
     app.run_polling()
-    
