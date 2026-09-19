@@ -12,7 +12,9 @@ from telegram import (
     InlineKeyboardButton,
     InputMediaPhoto,
     InputMediaVideo,
+    InputMediaDocument,
 )
+from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
@@ -20,7 +22,6 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
     ContextTypes,
-    ConversationHandler,
 )
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -31,13 +32,22 @@ ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
 CHANNEL_ID = os.environ["CHANNEL_ID"]
 CHANNEL_FOOTER = "\n\n[Фактум Новини | Підписатись](https://t.me/factum_ua)"
 
-WAIT_IMPORTANCE = 0
 user_data_store = {}
 
-# Час очікування решти повідомлень одного альбому (medіа-групи).
-# Поки чекаємо — усі фото/відео з альбому встигають прийти і зібратись разом.
-ALBUM_WAIT_SECONDS = 1.5
-media_group_buffers = {}  # media_group_id -> [Message, ...]
+BTN_NORMAL = "⚡️ Звичайна"
+BTN_IMPORTANT = "⚡️⚡️⚡️ Важлива"
+
+# Ліміт підпису до медіа в Telegram. Довший текст надсилається окремим
+# повідомленням ПІСЛЯ медіа — медіа не губиться і публікація не падає.
+CAPTION_LIMIT = 1024
+
+# Збір альбому: ждемо, поки повідомлення групи ПЕРЕСТАНУТЬ надходити.
+# Кожне нове фото/відео з альбому перезапускає відлік. ВАЖЛИВО: обробник
+# при цьому НЕ блокується (PTB за замовчуванням обробляє оновлення по одному,
+# тому sleep усередині обробника не давав решті фото альбому дійти до буфера).
+ALBUM_WAIT_SECONDS = 2.0
+media_group_buffers = {}  # media_group_id -> {"messages": [Message, ...], "task": Task}
+_background_tasks = set()  # щоб фонові задачі не збирав garbage collector
 
 # Список моделей Groq у порядку пріоритету. Якщо на поточній моделі
 # закінчився денний ліміт токенів (rate_limit_exceeded) або сталася
@@ -85,6 +95,9 @@ def build_post(raw_ai_text: str, emoji: str) -> str:
     text = raw_ai_text.strip()
     text = re.sub(r'^(⚡️)+', '', text).strip()
     text = text.replace('**', '').replace('*', '').strip()
+    # Екрануємо символи, які ламають Markdown Telegram (_ ` [) — інакше пост
+    # з "_" у тексті не відправляється взагалі ("can't parse entities").
+    text = re.sub(r'([_`\[])', r'\\\1', text)
     m = re.search(r'(.+?[.!?])(\s|\n|$)', text, re.DOTALL)
     if m:
         first = m.group(1).strip()
@@ -155,6 +168,14 @@ def ask_groq(text, importance, temperature=0.15):
     return build_post(raw, emoji)
 
 
+def _make_post(text, importance, temperature=0.15):
+    """Готовий пост. Якщо тексту немає (тільки медіа) — Groq не викликаємо,
+    щоб модель нічого не вигадала: піде лише підпис каналу."""
+    if not text:
+        return CHANNEL_FOOTER.strip()
+    return ask_groq(text, importance, temperature) + CHANNEL_FOOTER
+
+
 def get_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Опублікувати", callback_data="publish")],
@@ -172,112 +193,134 @@ async def check_access(update: Update) -> bool:
     return True
 
 
+# ============ МЕДІА: витягнення і відправка ============
 def _extract_media_item(msg):
-    """Визначити тип і file_id медіа одного повідомлення (photo/video/animation)."""
+    """Визначити тип і file_id медіа одного повідомлення
+    (photo / video / animation / document)."""
     if msg.photo:
         return {"type": "photo", "file_id": msg.photo[-1].file_id}
     if msg.video:
         return {"type": "video", "file_id": msg.video.file_id}
-    if msg.animation:
+    if msg.animation:  # гіфка має і animation, і document — перевіряємо її раніше
         return {"type": "animation", "file_id": msg.animation.file_id}
+    if msg.document:
+        return {"type": "document", "file_id": msg.document.file_id}
     return None
 
 
-def _build_media_group(media_list, caption):
-    """Зібрати список InputMedia для альбому. Альбоми Bot API підтримують
-    тільки photo/video (гіфки-animation в альбом не входять)."""
-    group = []
-    for i, item in enumerate(media_list):
-        cap = caption if i == 0 else None
-        parse_mode = "Markdown" if cap else None
-        if item["type"] == "photo":
-            group.append(InputMediaPhoto(item["file_id"], caption=cap, parse_mode=parse_mode))
-        elif item["type"] == "video":
-            group.append(InputMediaVideo(item["file_id"], caption=cap, parse_mode=parse_mode))
-    return group
+async def _md_fallback(send):
+    """Викликати send("Markdown"); якщо Telegram не зміг розібрати розмітку —
+    повторити без parse_mode. При такій помилці нічого не відправляється,
+    тому повтор безпечний (дубля не буде)."""
+    try:
+        return await send("Markdown")
+    except BadRequest as e:
+        if "parse entities" in str(e).lower():
+            return await send(None)
+        raise
 
 
-async def _send_result(target_message, media_list, result, kb):
-    """Надіслати готовий пост адміну: альбом (кілька фото/відео), одне медіа,
-    або тільки текст. Жодне медіа з альбому не губиться — усі частини,
-    зібрані в handle_message, надсилаються разом однією медіа-групою."""
-    photos_videos = [m for m in media_list if m["type"] in ("photo", "video")]
-    animations = [m for m in media_list if m["type"] == "animation"]
-
-    if len(photos_videos) > 1:
-        group = _build_media_group(photos_videos, result)
-        await target_message.reply_media_group(media=group)
-        # Telegram не дозволяє прикріпити inline-кнопки до медіа-групи —
-        # шлемо їх окремим коротким повідомленням одразу після альбому.
-        await target_message.reply_text("Готово 👇", reply_markup=kb)
-        for item in animations:
-            await target_message.reply_animation(animation=item["file_id"])
-        return
-
-    if len(media_list) == 1:
-        item = media_list[0]
-        if item["type"] == "photo":
-            await target_message.reply_photo(photo=item["file_id"], caption=result, parse_mode="Markdown", reply_markup=kb)
-        elif item["type"] == "video":
-            await target_message.reply_video(video=item["file_id"], caption=result, parse_mode="Markdown", reply_markup=kb)
-        elif item["type"] == "animation":
-            await target_message.reply_animation(animation=item["file_id"], caption=result, parse_mode="Markdown", reply_markup=kb)
-        return
-
-    # Тільки текст (або кілька гіфок без фото/відео — альбому з них не буває)
-    await target_message.reply_text(result, parse_mode="Markdown", reply_markup=kb)
-    for item in animations:
-        await target_message.reply_animation(animation=item["file_id"])
+def _build_units(media_list):
+    """Розкласти медіа на «одиниці» відправки. Альбом у Telegram — від 2 до 10
+    елементів, фото з відео можна змішувати, а файли (document) — тільки між
+    собою; гіфки не входять в альбоми. Довші набори ріжемо по 10, щоб жоден
+    файл не загубився через ліміт."""
+    units = []
+    for kinds in (("photo", "video"), ("document",)):
+        items = [m for m in media_list if m["type"] in kinds]
+        for i in range(0, len(items), 10):
+            chunk = items[i:i + 10]
+            units.append(("group", chunk) if len(chunk) > 1 else ("single", chunk[0]))
+    for m in media_list:
+        if m["type"] == "animation":
+            units.append(("single", m))
+    return units
 
 
-async def _publish_to_channel(bot, media_list, result):
-    """Опублікувати готовий пост у CHANNEL_ID: альбом, одне медіа, або тільки текст."""
-    photos_videos = [m for m in media_list if m["type"] in ("photo", "video")]
-    animations = [m for m in media_list if m["type"] == "animation"]
+async def _send_group(bot, chat_id, items, caption):
+    def build(parse_mode):
+        classes = {"photo": InputMediaPhoto, "video": InputMediaVideo, "document": InputMediaDocument}
+        group = []
+        for i, it in enumerate(items):
+            cap = caption if i == 0 else None
+            group.append(classes[it["type"]](it["file_id"], caption=cap, parse_mode=parse_mode if cap else None))
+        return group
 
-    if len(photos_videos) > 1:
-        group = _build_media_group(photos_videos, result)
-        await bot.send_media_group(chat_id=CHANNEL_ID, media=group)
-        for item in animations:
-            await bot.send_animation(chat_id=CHANNEL_ID, animation=item["file_id"])
-        return
+    async def send(parse_mode):
+        return await bot.send_media_group(chat_id=chat_id, media=build(parse_mode))
 
-    if len(media_list) == 1:
-        item = media_list[0]
-        if item["type"] == "photo":
-            await bot.send_photo(chat_id=CHANNEL_ID, photo=item["file_id"], caption=result, parse_mode="Markdown")
-        elif item["type"] == "video":
-            await bot.send_video(chat_id=CHANNEL_ID, video=item["file_id"], caption=result, parse_mode="Markdown")
-        elif item["type"] == "animation":
-            await bot.send_animation(chat_id=CHANNEL_ID, animation=item["file_id"], caption=result, parse_mode="Markdown")
-        return
-
-    await bot.send_message(chat_id=CHANNEL_ID, text=result, parse_mode="Markdown")
-    for item in animations:
-        await bot.send_animation(chat_id=CHANNEL_ID, animation=item["file_id"])
+    return await _md_fallback(send)
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_access(update):
-        return ConversationHandler.END
+async def _send_single(bot, chat_id, item, caption, kb):
+    methods = {
+        "photo": bot.send_photo,
+        "video": bot.send_video,
+        "animation": bot.send_animation,
+        "document": bot.send_document,
+    }
+    method = methods[item["type"]]
 
-    msg = update.message
-    group_id = msg.media_group_id
+    async def send(parse_mode):
+        return await method(
+            chat_id=chat_id,
+            caption=caption,
+            parse_mode=parse_mode if caption else None,
+            reply_markup=kb,
+            **{item["type"]: item["file_id"]},
+        )
 
-    if group_id:
-        # Це частина альбому. Збираємо ВСІ повідомлення групи в буфер і
-        # обробляємо їх разом лише один раз — коли перше повідомлення
-        # альбому дочекається решти (ALBUM_WAIT_SECONDS).
-        buffer = media_group_buffers.setdefault(group_id, [])
-        buffer.append(msg)
-        if len(buffer) > 1:
-            # Не перше повідомлення альбому — вже обробляється викликом,
-            # який зараз чекає (нижче). Більше нічого робити не треба.
-            return
-        await asyncio.sleep(ALBUM_WAIT_SECONDS)
-        messages = media_group_buffers.pop(group_id, buffer)
-    else:
-        messages = [msg]
+    return await _md_fallback(send)
+
+
+async def _send_text(bot, chat_id, text, kb):
+    async def send(parse_mode):
+        return await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=kb)
+
+    return await _md_fallback(send)
+
+
+async def _deliver(bot, chat_id, media_list, text, kb=None):
+    """Єдина відправка поста: і адміну (з кнопками kb), і в канал (kb=None).
+
+    Усі медіа йдуть разом; підпис — до першого медіа, якщо влізає в 1024
+    символи, інакше текст іде окремим повідомленням після медіа. Кнопки до
+    альбому прикріпити не можна, тому для нього шлемо окремий рядок «Готово»."""
+    units = _build_units(media_list)
+    caption_ok = bool(units) and bool(text) and len(text) <= CAPTION_LIMIT
+    kb_used = False
+
+    for idx, (kind, payload) in enumerate(units):
+        caption = text if (idx == 0 and caption_ok) else None
+        if kind == "group":
+            await _send_group(bot, chat_id, payload, caption)
+        else:
+            use_kb = kb if (len(units) == 1 and caption_ok) else None
+            await _send_single(bot, chat_id, payload, caption, use_kb)
+            if use_kb is not None:
+                kb_used = True
+
+    if text and not caption_ok:
+        await _send_text(bot, chat_id, text, kb)
+        if kb is not None:
+            kb_used = True
+
+    if kb is not None and not kb_used:
+        await bot.send_message(chat_id=chat_id, text="Готово 👇", reply_markup=kb)
+
+
+async def _show_result(context, chat_id, text, media_list, importance, temperature=0.15):
+    """Згенерувати пост, запам'ятати його разом з медіа і показати адміну."""
+    result = _make_post(text, importance, temperature)
+    context.user_data["last_result"] = result
+    context.user_data["last_media"] = media_list
+    await _deliver(context.bot, chat_id, media_list, result, get_keyboard())
+
+
+# ============ ПРИЙОМ ПОВІДОМЛЕНЬ ============
+async def _start_news(messages, user_id, context):
+    """Обробити зібране повідомлення (або весь альбом) як одну новину."""
+    msg = messages[0]
 
     # Підпис/текст зазвичай є лише в одному повідомленні альбому — беремо перший непорожній
     raw_text = ""
@@ -296,44 +339,102 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not cleaned and not media_list:
         await msg.reply_text("Не знайшов тексту. Перешліть текст або фото/відео з підписом.")
-        return ConversationHandler.END
+        return
 
-    user_data_store[update.effective_user.id] = {
-        "text": cleaned,
-        "media": media_list,
-    }
+    user_data_store[user_id] = {"text": cleaned, "media": media_list}
 
-    keyboard = [["⚡️ Звичайна", "⚡️⚡️⚡️ Важлива"]]
+    if not cleaned:
+        # Тільки медіа: питати важливість нема сенсу — одразу готуємо пост
+        context.user_data["importance"] = "звичайна"
+        context.user_data.pop("awaiting_importance", None)
+        await msg.reply_text("⏳ Готую...")
+        await _show_result(context, msg.chat_id, "", media_list, "звичайна")
+        return
+
+    context.user_data["awaiting_importance"] = True
+    keyboard = [[BTN_NORMAL, BTN_IMPORTANT]]
     await msg.reply_text(
         "Яка важливість новини?",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
     )
-    return WAIT_IMPORTANCE
+
+
+async def _finish_album(group_id, user_id, context):
+    """Фонова задача: дочекатись тиші в альбомі і обробити його ЦІЛКОМ."""
+    try:
+        await asyncio.sleep(ALBUM_WAIT_SECONDS)
+    except asyncio.CancelledError:
+        return  # прийшло ще одне фото альбому — відлік почнеться заново
+    entry = media_group_buffers.pop(group_id, None)
+    if not entry:
+        return
+    messages = sorted(entry["messages"], key=lambda m: m.message_id)
+    try:
+        await _start_news(messages, user_id, context)
+    except Exception as e:
+        try:
+            await messages[0].reply_text(f"Помилка: {e}")
+        except Exception:
+            pass
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update):
+        return
+
+    msg = update.message
+    user_id = update.effective_user.id
+
+    # Відповідь на питання про важливість (кнопки-відповіді)
+    if msg.text in (BTN_NORMAL, BTN_IMPORTANT) and context.user_data.get("awaiting_importance"):
+        await handle_importance(update, context)
+        return
+
+    group_id = msg.media_group_id
+    if group_id:
+        # Частина альбому: кладемо в буфер і одразу повертаємось (не блокуємо
+        # обробку решти фото). Обробку запускає фонова задача після «тиші».
+        entry = media_group_buffers.setdefault(group_id, {"messages": [], "task": None})
+        entry["messages"].append(msg)
+        if entry["task"]:
+            entry["task"].cancel()
+        task = asyncio.create_task(_finish_album(group_id, user_id, context))
+        entry["task"] = task
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+        return
+
+    await _start_news([msg], user_id, context)
 
 
 async def handle_importance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_access(update):
-        return ConversationHandler.END
+        return
 
     importance = "важлива" if "Важлива" in update.message.text else "звичайна"
     context.user_data["importance"] = importance
+    context.user_data.pop("awaiting_importance", None)
     stored = user_data_store.get(update.effective_user.id, {})
     text = stored.get("text", "")
     media_list = stored.get("media", [])
 
     await update.message.reply_text("⏳ Форматую...", reply_markup=ReplyKeyboardRemove())
     try:
-        result = ask_groq(text, importance) + CHANNEL_FOOTER
-        context.user_data["last_result"] = result
-        context.user_data["last_media"] = media_list
-
-        kb = get_keyboard()
-        await _send_result(update.message, media_list, result, kb)
+        await _show_result(context, update.message.chat_id, text, media_list, importance)
     except Exception as e:
         await update.message.reply_text(f"Помилка: {e}")
-    return ConversationHandler.END
 
 
+async def handle_unsupported(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Усе, що не текст/фото/відео/гіфка/файл, — не ігноруємо мовчки."""
+    if not await check_access(update):
+        return
+    await update.message.reply_text(
+        "⚠️ Цей тип вкладення не підтримується. Працюю з текстом, фото, відео, гіфками та файлами."
+    )
+
+
+# ============ КНОПКИ ============
 async def handle_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -347,11 +448,7 @@ async def handle_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.message.reply_text("⏳ Переробляю...")
     try:
-        result = ask_groq(text, importance, temperature=0.7) + CHANNEL_FOOTER
-        context.user_data["last_result"] = result
-
-        kb = get_keyboard()
-        await _send_result(query.message, media_list, result, kb)
+        await _show_result(context, query.message.chat_id, text, media_list, importance, temperature=0.7)
     except Exception as e:
         await query.message.reply_text(f"Помилка: {e}")
 
@@ -365,7 +462,11 @@ async def handle_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     importance = context.user_data.get("importance", "звичайна")
     media_list = context.user_data.get("last_media", [])
     last_result = context.user_data.get("last_result", "")
-    clean_result = last_result.replace(CHANNEL_FOOTER, "").replace("*", "").strip()
+    clean_result = last_result.replace(CHANNEL_FOOTER, "").replace("*", "").replace("\\", "").strip()
+
+    if not clean_result:
+        await query.message.reply_text("⚠️ Немає тексту для виправлення. Спочатку сформуйте новину.")
+        return
 
     await query.message.reply_text("✏️ Виправляю помилки...")
     try:
@@ -384,8 +485,7 @@ async def handle_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = build_post(raw, emoji) + CHANNEL_FOOTER
         context.user_data["last_result"] = result
 
-        kb = get_keyboard()
-        await _send_result(query.message, media_list, result, kb)
+        await _deliver(context.bot, query.message.chat_id, media_list, result, get_keyboard())
     except Exception as e:
         await query.message.reply_text(f"Помилка: {e}")
 
@@ -404,20 +504,26 @@ async def handle_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        await _publish_to_channel(context.bot, media_list, result)
-        await query.message.reply_text("✅ Опубліковано в канал!")
-        # Прибираємо кнопки, щоб випадково не опублікувати вдруге
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
+        await _deliver(context.bot, CHANNEL_ID, media_list, result)
     except Exception as e:
+        # last_result НЕ чистимо — можна натиснути «Опублікувати» ще раз
         await query.message.reply_text(f"Помилка публікації: {e}")
+        return
+
+    # Пост опубліковано: чистимо, щоб старі кнопки не опублікували його вдруге
+    context.user_data.pop("last_result", None)
+    await query.message.reply_text("✅ Опубліковано в канал!")
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update):
+        return
+    context.user_data.pop("awaiting_importance", None)
     await update.message.reply_text("Скасовано.", reply_markup=ReplyKeyboardRemove())
-    return ConversationHandler.END
 
 
 if __name__ == "__main__":
@@ -426,23 +532,20 @@ if __name__ == "__main__":
     asyncio.set_event_loop(loop)
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    entry_filter = (
+    entry_filter = filters.UpdateType.MESSAGE & (
         (filters.TEXT & ~filters.COMMAND)
         | filters.PHOTO
         | filters.VIDEO
         | filters.ANIMATION
+        | filters.Document.ALL
     )
 
-    conv = ConversationHandler(
-        entry_points=[MessageHandler(entry_filter, handle_message)],
-        states={
-            WAIT_IMPORTANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_importance)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)]
-    )
-    app.add_handler(conv)
+    app.add_handler(MessageHandler(entry_filter, handle_message))
+    app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CallbackQueryHandler(handle_publish, pattern="^publish$"))
     app.add_handler(CallbackQueryHandler(handle_retry, pattern="^retry$"))
     app.add_handler(CallbackQueryHandler(handle_fix, pattern="^fix$"))
+    # Останнім: усе, що не підійшло вище (аудіо, голосові, стікери...)
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & ~filters.COMMAND, handle_unsupported))
     print("Бот запущено")
     app.run_polling()
