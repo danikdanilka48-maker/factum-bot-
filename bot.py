@@ -1,5 +1,8 @@
 import os
 import re
+import html
+import shutil
+import tempfile
 import asyncio
 import threading
 import requests
@@ -24,13 +27,57 @@ from telegram.ext import (
     ContextTypes,
 )
 
+try:  # Telethon потрібен лише для публікації від імені твого акаунта
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    from telethon.tl.types import DocumentAttributeAnimated
+except ImportError:
+    TelegramClient = None
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
-# ID або @username каналу для публікації. Бот повинен бути адміном
-# цього каналу з правом надсилати повідомлення.
-CHANNEL_ID = os.environ["CHANNEL_ID"]
+
+
+def _normalize_channel_id(raw):
+    """Привести CHANNEL_ID до формату, який розуміє Telegram:
+    @username для публічного каналу, -100XXXXXXXXXX для закритого.
+    Прибирає пробіли й лапки, розуміє посилання t.me/..., додає @ і -100."""
+    v = (raw or "").strip().strip("\"'").strip()
+    m = re.match(r"^(?:https?://)?(?:t\.me|telegram\.me)/(.+)$", v, re.I)
+    if m:
+        tail = m.group(1).split("?")[0].strip("/")
+        if tail.startswith("+") or tail.startswith("joinchat"):
+            return v  # запрошувальне посилання як адресу використати не можна
+        if tail.startswith("c/"):  # https://t.me/c/1234567890/5
+            return "-100" + tail[2:].split("/")[0]
+        v = "@" + tail.split("/")[0]
+    if re.fullmatch(r"\d+", v):  # «голий» id каналу без -100
+        return "-100" + v
+    if re.fullmatch(r"-\d+", v):
+        return v
+    if not v.startswith("@"):
+        v = "@" + v
+    return v
+
+
+# ID або @username каналу для публікації.
+CHANNEL_ID = _normalize_channel_id(os.environ["CHANNEL_ID"])
+print(f"CHANNEL_ID = {CHANNEL_ID!r}")
 CHANNEL_FOOTER = "\n\n[Фактум Новини | Підписатись](https://t.me/factum_ua)"
+
+# --- Публікація від імені ТВОГО акаунта (userbot) ---
+# Якщо бота не можна додати адміном у канал, у канал публікує твій акаунт
+# (Telethon). Бот залишається інтерфейсом: приймає новину, робить пост, показує
+# кнопки. Вмикається автоматично, коли задані API_ID, API_HASH і STRING_SESSION
+# (їх дає gen_session.py). Твій акаунт має бути адміном каналу з правом публікації.
+API_ID = int(os.environ.get("API_ID", "0") or 0)
+API_HASH = os.environ.get("API_HASH", "").strip()
+STRING_SESSION = os.environ.get("STRING_SESSION", "").strip()
+USE_USERBOT = bool(API_ID and API_HASH and STRING_SESSION)
+userbot = None          # заповнюється в _post_init
+userbot_error = None    # причина, якщо акаунт не вдалося підключити
+channel_entity = None   # канал, знайдений акаунтом
 
 user_data_store = {}
 
@@ -204,7 +251,8 @@ def _extract_media_item(msg):
     if msg.animation:  # гіфка має і animation, і document — перевіряємо її раніше
         return {"type": "animation", "file_id": msg.animation.file_id}
     if msg.document:
-        return {"type": "document", "file_id": msg.document.file_id}
+        return {"type": "document", "file_id": msg.document.file_id,
+                "name": msg.document.file_name}
     return None
 
 
@@ -307,6 +355,101 @@ async def _deliver(bot, chat_id, media_list, text, kb=None):
 
     if kb is not None and not kb_used:
         await bot.send_message(chat_id=chat_id, text="Готово 👇", reply_markup=kb)
+
+
+# ============ ВІДПРАВКА В КАНАЛ ВІД ІМЕНІ АКАУНТА ============
+def _tg_target(value):
+    """Для Telethon числовий id має бути int, а @username — рядком."""
+    return int(value) if re.fullmatch(r"-?\d+", str(value)) else value
+
+
+def _post_to_html(post):
+    """Markdown Bot API (*жирний*, [текст](url), \\_ екранування) → HTML для Telethon."""
+    pattern = re.compile(
+        r"(?<!\\)\[(.+?)\]\((https?://[^)\s]+)\)|(?<!\\)\*(.+?)\*", re.DOTALL
+    )
+
+    def unesc(s):
+        return re.sub(r"\\([_`\[])", r"\1", s)
+
+    def esc(s):
+        return html.escape(unesc(s), quote=False)
+
+    out, pos = [], 0
+    for m in pattern.finditer(post):
+        out.append(esc(post[pos:m.start()]))
+        if m.group(1) is not None:
+            url = html.escape(m.group(2), quote=True)
+            out.append(f'<a href="{url}">{esc(m.group(1))}</a>')
+        else:
+            out.append(f"<b>{esc(m.group(3))}</b>")
+        pos = m.end()
+    out.append(esc(post[pos:]))
+    return "".join(out)
+
+
+async def _download_item(bot, item, tmpdir, index):
+    """Скачати медіа, яке ти надіслав боту, у тимчасову папку."""
+    try:
+        tg_file = await bot.get_file(item["file_id"])
+    except BadRequest as e:
+        if "too big" in str(e).lower():
+            raise RuntimeError("файл більший за 20 МБ — Bot API не дозволяє його завантажити") from e
+        raise
+    if item["type"] == "document":
+        name = os.path.basename(item.get("name") or "file")
+    else:
+        name = "media" + {"photo": ".jpg", "video": ".mp4", "animation": ".mp4"}[item["type"]]
+    folder = os.path.join(tmpdir, str(index))
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, name)
+    await tg_file.download_to_drive(custom_path=path)
+    return path
+
+
+async def _deliver_as_user(bot, media_list, post_text):
+    """Опублікувати пост у канал ВІД ІМЕНІ ТВОГО АКАУНТА.
+
+    Спочатку скачуємо ВСІ файли, і лише потім відправляємо: якщо якийсь файл не
+    скачався, у канал не піде нічого (без «половини альбому»)."""
+    target = channel_entity or _tg_target(CHANNEL_ID)
+    text = _post_to_html(post_text)
+    visible_len = len(html.unescape(re.sub(r"<[^>]+>", "", text)))
+    units = _build_units(media_list)
+    caption_ok = bool(units) and visible_len <= CAPTION_LIMIT
+
+    tmpdir = tempfile.mkdtemp(prefix="post_")
+    try:
+        prepared = []
+        counter = 0
+        for kind, payload in units:
+            items = payload if kind == "group" else [payload]
+            paths = []
+            for it in items:
+                paths.append(await _download_item(bot, it, tmpdir, counter))
+                counter += 1
+            prepared.append((items, paths))
+
+        for idx, (items, paths) in enumerate(prepared):
+            caption = text if (idx == 0 and caption_ok) else ""
+            kinds = {it["type"] for it in items}
+            extra = {}
+            if kinds == {"document"}:
+                extra["force_document"] = True  # щоб фото-файли не стискались у фото
+            elif kinds == {"animation"}:
+                extra["attributes"] = [DocumentAttributeAnimated()]  # лишається гіфкою
+            await userbot.send_file(
+                target,
+                file=paths if len(paths) > 1 else paths[0],
+                caption=caption,
+                parse_mode="html" if caption else None,
+                supports_streaming=True,
+                **extra,
+            )
+        if text and not caption_ok:
+            await userbot.send_message(target, text, parse_mode="html")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 async def _show_result(context, chat_id, text, media_list, importance, temperature=0.15):
@@ -503,11 +646,26 @@ async def handle_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("⚠️ Немає готового посту для публікації. Спочатку сформуйте новину.")
         return
 
+    if USE_USERBOT and userbot is None:
+        await query.message.reply_text(
+            "⚠️ Акаунт для публікації не підключено"
+            + (f": {userbot_error}" if userbot_error else ".")
+            + "\nПеревір STRING_SESSION і перезапусти бота."
+        )
+        return
+
     try:
-        await _deliver(context.bot, CHANNEL_ID, media_list, result)
+        if userbot is not None:
+            await _deliver_as_user(context.bot, media_list, result)
+        else:
+            await _deliver(context.bot, CHANNEL_ID, media_list, result)
     except Exception as e:
         # last_result НЕ чистимо — можна натиснути «Опублікувати» ще раз
-        await query.message.reply_text(f"Помилка публікації: {e}")
+        hint = ""
+        if userbot is None and "chat not found" in str(e).lower():
+            hint = ("\n\nБот не бачить канал (він не адмін). Щоб публікувати від свого імені, "
+                    "задай API_ID, API_HASH і STRING_SESSION (їх дає gen_session.py).")
+        await query.message.reply_text(f"Помилка публікації: {e}{hint}")
         return
 
     # Пост опубліковано: чистимо, щоб старі кнопки не опублікували його вдруге
@@ -517,6 +675,98 @@ async def handle_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
         pass
+
+
+async def check_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/checkchannel — перевірка, чи бачить канал той, хто публікує."""
+    if not await check_access(update):
+        return
+
+    lines = [f"CHANNEL_ID: {CHANNEL_ID!r}"]
+
+    if USE_USERBOT:
+        if userbot is None:
+            lines.append(f"❌ Акаунт не підключено: {userbot_error or 'не запущено'}")
+            await update.message.reply_text("\n".join(lines))
+            return
+        # Публікує твій акаунт — перевіряємо його права, а не бота
+        try:
+            me = await userbot.get_me()
+            lines.append(f"Публікація від акаунта: {me.first_name} (id {me.id})")
+            ent = channel_entity or await userbot.get_entity(_tg_target(CHANNEL_ID))
+            lines.append(f"✅ Канал знайдено: {getattr(ent, 'title', ent)}")
+            perms = await userbot.get_permissions(ent)
+            can = bool(perms.is_creator or perms.post_messages)
+            lines.append(
+                "Право публікувати: "
+                + ("✅ є" if can else "❌ немає — акаунт має бути адміном каналу з правом публікації")
+            )
+        except Exception as e:
+            lines.append(f"❌ {e}")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    lines.append("Режим: публікація через бота (бот має бути адміном каналу)")
+    try:
+        chat = await context.bot.get_chat(CHANNEL_ID)
+        lines.append(f"✅ Канал знайдено: {chat.title}")
+        member = await context.bot.get_chat_member(chat.id, context.bot.id)
+        lines.append(f"Статус бота: {member.status}")
+        if member.status == "creator":
+            lines.append("Право публікувати: ✅ є")
+        elif member.status == "administrator":
+            can = getattr(member, "can_post_messages", None)
+            lines.append("Право публікувати: " + ("✅ є" if can else "❌ немає — увімкни «Публікація повідомлень»"))
+        else:
+            lines.append("❌ Бот не адміністратор каналу")
+    except Exception as e:
+        lines.append(f"❌ {e}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def _post_init(application):
+    """Запуск userbot усередині event loop бота (Telethon так вимагає)."""
+    global userbot, userbot_error, channel_entity
+    if not USE_USERBOT:
+        print("Публікація: через бота (він має бути адміном каналу)")
+        return
+    if TelegramClient is None:
+        userbot_error = "не встановлено telethon (pip install telethon hachoir)"
+        print(f"⚠️ {userbot_error}")
+        return
+
+    client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            userbot_error = "STRING_SESSION недійсна — створи нову через gen_session.py"
+            print(f"⚠️ {userbot_error}")
+            return
+        me = await client.get_me()
+    except Exception as e:
+        userbot_error = str(e)
+        print(f"⚠️ Не вдалося підключити акаунт: {e}")
+        return
+
+    userbot = client
+    target = _tg_target(CHANNEL_ID)
+    try:
+        try:
+            channel_entity = await userbot.get_entity(target)
+        except ValueError:
+            # числовий id Telethon знає лише після завантаження діалогів
+            await userbot.get_dialogs()
+            channel_entity = await userbot.get_entity(target)
+        print(f"Публікація: від акаунта {me.first_name} → {getattr(channel_entity, 'title', CHANNEL_ID)}")
+    except Exception as e:
+        channel_entity = None
+        print(f"⚠️ Акаунт {me.first_name} не бачить канал {CHANNEL_ID!r}: {e}")
+
+
+async def _post_shutdown(application):
+    if userbot is not None:
+        await userbot.disconnect()
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -530,7 +780,13 @@ if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
+        .build()
+    )
 
     entry_filter = filters.UpdateType.MESSAGE & (
         (filters.TEXT & ~filters.COMMAND)
@@ -542,6 +798,7 @@ if __name__ == "__main__":
 
     app.add_handler(MessageHandler(entry_filter, handle_message))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("checkchannel", check_channel))
     app.add_handler(CallbackQueryHandler(handle_publish, pattern="^publish$"))
     app.add_handler(CallbackQueryHandler(handle_retry, pattern="^retry$"))
     app.add_handler(CallbackQueryHandler(handle_fix, pattern="^fix$"))
