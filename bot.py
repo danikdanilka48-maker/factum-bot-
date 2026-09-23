@@ -2,7 +2,6 @@ import os
 import re
 import html
 import shutil
-import logging
 import tempfile
 import asyncio
 import threading
@@ -19,6 +18,11 @@ from telegram import (
     InputMediaDocument,
 )
 from telegram.error import BadRequest
+try:  # Telethon потрібен лише для публікації від імені твого акаунта
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+except ImportError:
+    TelegramClient = None
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
@@ -28,62 +32,38 @@ from telegram.ext import (
     ContextTypes,
 )
 
-try:  # Telethon потрібен лише для публікації від імені твого акаунта
-    from telethon import TelegramClient
-    from telethon.sessions import StringSession
-    from telethon.tl.types import DocumentAttributeAnimated
-except ImportError:
-    TelegramClient = None
-
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
-)
-logger = logging.getLogger("factum_bot")
-
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
-
-
+# ID або @username каналу для публікації. Бот повинен бути адміном
+# цього каналу з правом надсилати повідомлення.
 def _normalize_channel_id(raw):
-    """Привести CHANNEL_ID до формату, який розуміє Telegram:
-    @username для публічного каналу, -100XXXXXXXXXX для закритого.
-    Прибирає пробіли й лапки, розуміє посилання t.me/..., додає @ і -100."""
-    v = (raw or "").strip().strip("\"'").strip()
-    m = re.match(r"^(?:https?://)?(?:t\.me|telegram\.me)/(.+)$", v, re.I)
-    if m:
-        tail = m.group(1).split("?")[0].strip("/")
-        if tail.startswith("+") or tail.startswith("joinchat"):
-            return v  # запрошувальне посилання як адресу використати не можна
-        if tail.startswith("c/"):  # https://t.me/c/1234567890/5
-            return "-100" + tail[2:].split("/")[0]
-        v = "@" + tail.split("/")[0]
-    if re.fullmatch(r"\d+", v):  # «голий» id каналу без -100
-        return "-100" + v
-    if re.fullmatch(r"-\d+", v):
-        return v
-    if not v.startswith("@"):
-        v = "@" + v
-    return v
+    """Привести CHANNEL_ID к виду, который понимает Bot API:
+    - пробелы/кавычки и ссылку https://t.me/name отбрасываем;
+    - число → int; «голый» положительный id канала получает префикс -100;
+    - иначе это username → добавляем @."""
+    value = raw.strip().strip("\"'").strip()
+    value = re.sub(r'^https?://t\.me/', '', value)
+    if re.fullmatch(r'-?\d+', value):
+        number = int(value)
+        return number if number < 0 else int(f"-100{number}")
+    return value if value.startswith("@") else "@" + value
 
 
-# ID або @username каналу для публікації.
 CHANNEL_ID = _normalize_channel_id(os.environ["CHANNEL_ID"])
 print(f"CHANNEL_ID = {CHANNEL_ID!r}")
-CHANNEL_FOOTER = "\n\n[Фактум Новини | Підписатись](https://t.me/factum_ua)"
 
 # --- Публікація від імені ТВОГО акаунта (userbot) ---
 # Якщо бота не можна додати адміном у канал, у канал публікує твій акаунт
 # (Telethon). Бот залишається інтерфейсом: приймає новину, робить пост, показує
-# кнопки. Вмикається автоматично, коли задані API_ID, API_HASH і STRING_SESSION
-# (їх дає gen_session.py). Твій акаунт має бути адміном каналу з правом публікації.
+# кнопки. Увімкнеться автоматично, коли задані API_ID, API_HASH і STRING_SESSION.
 API_ID = int(os.environ.get("API_ID", "0") or 0)
 API_HASH = os.environ.get("API_HASH", "").strip()
 STRING_SESSION = os.environ.get("STRING_SESSION", "").strip()
 USE_USERBOT = bool(API_ID and API_HASH and STRING_SESSION)
-userbot = None          # заповнюється в _post_init
-userbot_error = None    # причина, якщо акаунт не вдалося підключити
-channel_entity = None   # канал, знайдений акаунтом
+userbot = None         # заповнюється в _post_init
+channel_entity = None  # канал, знайдений акаунтом
+CHANNEL_FOOTER = "\n\n[Фактум Новини | Підписатись](https://t.me/factum_ua)"
 
 user_data_store = {}
 
@@ -165,9 +145,12 @@ def build_post(raw_ai_text: str, emoji: str) -> str:
     return post
 
 
-def _call_groq_sync(messages, temperature=0.15, timeout=30):
-    """Синхронний виклик Groq (звичайний requests.post). НЕ викликати напряму
-    з async-коду — він блокує процес; для цього є call_groq нижче."""
+def call_groq(messages, temperature=0.15, timeout=30):
+    """Викликати Groq chat completion, перебираючи моделі зі списку
+    GROQ_MODELS по черзі. Якщо модель впирається в ліміт токенів
+    (rate_limit_exceeded) чи повертає іншу помилку — пробуємо наступну
+    модель зі списку. Якщо жодна модель не спрацювала — кидаємо
+    останню отриману помилку."""
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
 
@@ -192,15 +175,7 @@ def _call_groq_sync(messages, temperature=0.15, timeout=30):
     raise last_error if last_error else Exception("Усі моделі Groq недоступні")
 
 
-async def call_groq(messages, temperature=0.15, timeout=30):
-    """Async-обгортка над Groq. Бот однопроцесний і обробляє одне оновлення за
-    раз: звичайний requests.post усередині async-обробника заморожує ВЕСЬ
-    бот (у тому числі натискання кнопок) на час запиту. asyncio.to_thread
-    виносить запит у окремий потік, щоб решта бота лишалась чутливою."""
-    return await asyncio.to_thread(_call_groq_sync, messages, temperature, timeout)
-
-
-async def ask_groq(text, importance, temperature=0.15):
+def ask_groq(text, importance, temperature=0.15):
     emoji = "⚡️⚡️⚡️" if importance == "важлива" else "⚡️"
 
     prompt = f"""Ти — редактор українського новинного Telegram-каналу.
@@ -222,16 +197,16 @@ async def ask_groq(text, importance, temperature=0.15):
 Текст новини:
 {text}"""
 
-    raw = await call_groq([{"role": "user", "content": prompt}], temperature=temperature)
+    raw = call_groq([{"role": "user", "content": prompt}], temperature=temperature)
     return build_post(raw, emoji)
 
 
-async def _make_post(text, importance, temperature=0.15):
+def _make_post(text, importance, temperature=0.15):
     """Готовий пост. Якщо тексту немає (тільки медіа) — Groq не викликаємо,
     щоб модель нічого не вигадала: піде лише підпис каналу."""
     if not text:
         return CHANNEL_FOOTER.strip()
-    return await ask_groq(text, importance, temperature) + CHANNEL_FOOTER
+    return ask_groq(text, importance, temperature) + CHANNEL_FOOTER
 
 
 def get_keyboard():
@@ -369,51 +344,23 @@ async def _deliver(bot, chat_id, media_list, text, kb=None):
 
 
 # ============ ВІДПРАВКА В КАНАЛ ВІД ІМЕНІ АКАУНТА ============
-def _tg_target(value):
-    """Для Telethon числовий id має бути int, а @username — рядком."""
-    return int(value) if re.fullmatch(r"-?\d+", str(value)) else value
-
-
 def _post_to_html(post):
     """Markdown Bot API (*жирний*, [текст](url), \\_ екранування) → HTML для Telethon."""
-    pattern = re.compile(
-        r"(?<!\\)\[(.+?)\]\((https?://[^)\s]+)\)|(?<!\\)\*(.+?)\*", re.DOTALL
-    )
-
-    def unesc(s):
-        return re.sub(r"\\([_`\[])", r"\1", s)
-
-    def esc(s):
-        return html.escape(unesc(s), quote=False)
-
-    out, pos = [], 0
-    for m in pattern.finditer(post):
-        out.append(esc(post[pos:m.start()]))
-        if m.group(1) is not None:
-            url = html.escape(m.group(2), quote=True)
-            out.append(f'<a href="{url}">{esc(m.group(1))}</a>')
-        else:
-            out.append(f"<b>{esc(m.group(3))}</b>")
-        pos = m.end()
-    out.append(esc(post[pos:]))
-    return "".join(out)
-
-
-# Скільки чекати одну мережеву операцію публікації від акаунта, перш ніж
-# здатись і показати помилку замість вічного «завантаження» кнопки.
-USERBOT_STEP_TIMEOUT = 120
+    text = post.replace("\\_", "_").replace("\\`", "`").replace("\\[", "[")
+    text = html.escape(text, quote=False)
+    text = re.sub(r"\*(.+?)\*", r"<b>\1</b>", text, flags=re.DOTALL)
+    text = re.sub(r"\[(.+?)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', text)
+    return text
 
 
 async def _download_item(bot, item, tmpdir, index):
     """Скачати медіа, яке ти надіслав боту, у тимчасову папку."""
     try:
-        tg_file = await asyncio.wait_for(bot.get_file(item["file_id"]), USERBOT_STEP_TIMEOUT)
+        tg_file = await bot.get_file(item["file_id"])
     except BadRequest as e:
         if "too big" in str(e).lower():
             raise RuntimeError("файл більший за 20 МБ — Bot API не дозволяє його завантажити") from e
         raise
-    except asyncio.TimeoutError as e:
-        raise RuntimeError("Telegram не відповів на запит файлу (тайм-аут)") from e
     if item["type"] == "document":
         name = os.path.basename(item.get("name") or "file")
     else:
@@ -421,10 +368,7 @@ async def _download_item(bot, item, tmpdir, index):
     folder = os.path.join(tmpdir, str(index))
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, name)
-    try:
-        await asyncio.wait_for(tg_file.download_to_drive(custom_path=path), USERBOT_STEP_TIMEOUT)
-    except asyncio.TimeoutError as e:
-        raise RuntimeError(f"Скачування файлу зависло довше {USERBOT_STEP_TIMEOUT} с") from e
+    await tg_file.download_to_drive(custom_path=path)
     return path
 
 
@@ -433,11 +377,11 @@ async def _deliver_as_user(bot, media_list, post_text):
 
     Спочатку скачуємо ВСІ файли, і лише потім відправляємо: якщо якийсь файл не
     скачався, у канал не піде нічого (без «половини альбому»)."""
-    target = channel_entity or _tg_target(CHANNEL_ID)
+    target = channel_entity or CHANNEL_ID
     text = _post_to_html(post_text)
-    visible_len = len(html.unescape(re.sub(r"<[^>]+>", "", text)))
+    plain_len = len(re.sub(r"<[^>]+>", "", text))
     units = _build_units(media_list)
-    caption_ok = bool(units) and visible_len <= CAPTION_LIMIT
+    caption_ok = bool(units) and plain_len <= CAPTION_LIMIT
 
     tmpdir = tempfile.mkdtemp(prefix="post_")
     try:
@@ -449,44 +393,26 @@ async def _deliver_as_user(bot, media_list, post_text):
             for it in items:
                 paths.append(await _download_item(bot, it, tmpdir, counter))
                 counter += 1
-            prepared.append((items, paths))
+            prepared.append(paths)
 
-        for idx, (items, paths) in enumerate(prepared):
-            caption = text if (idx == 0 and caption_ok) else ""
-            kinds = {it["type"] for it in items}
-            extra = {}
-            if kinds == {"document"}:
-                extra["force_document"] = True  # щоб фото-файли не стискались у фото
-            elif kinds == {"animation"}:
-                extra["attributes"] = [DocumentAttributeAnimated()]  # лишається гіфкою
-            try:
-                await asyncio.wait_for(
-                    userbot.send_file(
-                        target,
-                        file=paths if len(paths) > 1 else paths[0],
-                        caption=caption,
-                        parse_mode="html" if caption else None,
-                        supports_streaming=True,
-                        **extra,
-                    ),
-                    USERBOT_STEP_TIMEOUT,
-                )
-            except asyncio.TimeoutError as e:
-                raise RuntimeError(f"Відправка в канал зависла довше {USERBOT_STEP_TIMEOUT} с") from e
+        for idx, paths in enumerate(prepared):
+            caption = text if (idx == 0 and caption_ok) else None
+            await userbot.send_file(
+                target,
+                file=paths if len(paths) > 1 else paths[0],
+                caption=caption,
+                parse_mode="html" if caption else None,
+                supports_streaming=True,
+            )
         if text and not caption_ok:
-            try:
-                await asyncio.wait_for(
-                    userbot.send_message(target, text, parse_mode="html"), USERBOT_STEP_TIMEOUT
-                )
-            except asyncio.TimeoutError as e:
-                raise RuntimeError(f"Відправка тексту зависла довше {USERBOT_STEP_TIMEOUT} с") from e
+            await userbot.send_message(target, text, parse_mode="html")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 async def _show_result(context, chat_id, text, media_list, importance, temperature=0.15):
     """Згенерувати пост, запам'ятати його разом з медіа і показати адміну."""
-    result = await _make_post(text, importance, temperature)
+    result = _make_post(text, importance, temperature)
     context.user_data["last_result"] = result
     context.user_data["last_media"] = media_list
     await _deliver(context.bot, chat_id, media_list, result, get_keyboard())
@@ -654,7 +580,7 @@ async def handle_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Текст:
 {clean_result}"""
-        raw = await call_groq([{"role": "user", "content": fix_prompt}], temperature=0.1)
+        raw = call_groq([{"role": "user", "content": fix_prompt}], temperature=0.1)
 
         emoji = "⚡️⚡️⚡️" if importance == "важлива" else "⚡️"
         result = build_post(raw, emoji) + CHANNEL_FOOTER
@@ -678,14 +604,6 @@ async def handle_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("⚠️ Немає готового посту для публікації. Спочатку сформуйте новину.")
         return
 
-    if USE_USERBOT and userbot is None:
-        await query.message.reply_text(
-            "⚠️ Акаунт для публікації не підключено"
-            + (f": {userbot_error}" if userbot_error else ".")
-            + "\nПеревір STRING_SESSION і перезапусти бота."
-        )
-        return
-
     try:
         if userbot is not None:
             await _deliver_as_user(context.bot, media_list, result)
@@ -696,7 +614,7 @@ async def handle_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hint = ""
         if userbot is None and "chat not found" in str(e).lower():
             hint = ("\n\nБот не бачить канал (він не адмін). Щоб публікувати від свого імені, "
-                    "задай API_ID, API_HASH і STRING_SESSION (їх дає gen_session.py).")
+                    "задай API_ID, API_HASH і STRING_SESSION.")
         await query.message.reply_text(f"Помилка публікації: {e}{hint}")
         return
 
@@ -710,86 +628,63 @@ async def handle_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def check_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/checkchannel — перевірка, чи бачить канал той, хто публікує."""
+    """/checkchannel — показує, чому бот не може публікувати в канал."""
     if not await check_access(update):
         return
-
     lines = [f"CHANNEL_ID: {CHANNEL_ID!r}"]
-
-    if USE_USERBOT:
-        if userbot is None:
-            lines.append(f"❌ Акаунт не підключено: {userbot_error or 'не запущено'}")
-            await update.message.reply_text("\n".join(lines))
-            return
+    if userbot is not None:
         # Публікує твій акаунт — перевіряємо його права, а не бота
         try:
             me = await userbot.get_me()
             lines.append(f"Публікація від акаунта: {me.first_name} (id {me.id})")
-            ent = channel_entity or await userbot.get_entity(_tg_target(CHANNEL_ID))
+            ent = channel_entity or await userbot.get_entity(CHANNEL_ID)
             lines.append(f"✅ Канал знайдено: {getattr(ent, 'title', ent)}")
             perms = await userbot.get_permissions(ent)
             can = bool(perms.is_creator or perms.post_messages)
-            lines.append(
-                "Право публікувати: "
-                + ("✅ є" if can else "❌ немає — акаунт має бути адміном каналу з правом публікації")
-            )
+            lines.append(f"Право публікувати: {'✅ є' if can else '❌ немає — акаунт має бути адміном каналу з правом публікації'}")
         except Exception as e:
             lines.append(f"❌ {e}")
         await update.message.reply_text("\n".join(lines))
         return
-
     lines.append("Режим: публікація через бота (бот має бути адміном каналу)")
     try:
         chat = await context.bot.get_chat(CHANNEL_ID)
-        lines.append(f"✅ Канал знайдено: {chat.title}")
-        member = await context.bot.get_chat_member(chat.id, context.bot.id)
-        lines.append(f"Статус бота: {member.status}")
-        if member.status == "creator":
-            lines.append("Право публікувати: ✅ є")
-        elif member.status == "administrator":
-            can = getattr(member, "can_post_messages", None)
-            lines.append("Право публікувати: " + ("✅ є" if can else "❌ немає — увімкни «Публікація повідомлень»"))
-        else:
-            lines.append("❌ Бот не адміністратор каналу")
+        lines.append(f"✅ Канал знайдено: {chat.title} (id {chat.id}, тип {chat.type})")
     except Exception as e:
-        lines.append(f"❌ {e}")
+        lines.append(f"❌ Канал не знайдено: {e}")
+        lines.append("Перевір CHANNEL_ID і що бота додано в канал адміністратором.")
+        await update.message.reply_text("\n".join(lines))
+        return
+    try:
+        me = await context.bot.get_me()
+        member = await context.bot.get_chat_member(chat.id, me.id)
+        lines.append(f"Статус бота в каналі: {member.status}")
+        if member.status == "administrator":
+            can_post = getattr(member, "can_post_messages", None)
+            lines.append(f"Право публікувати: {'✅ є' if can_post else '❌ немає — увімкни «Публікація повідомлень»'}")
+        else:
+            lines.append("❌ Бот має бути адміністратором каналу.")
+    except Exception as e:
+        lines.append(f"❌ Не вдалося перевірити права бота: {e}")
     await update.message.reply_text("\n".join(lines))
 
 
 async def _post_init(application):
     """Запуск userbot усередині event loop бота (Telethon так вимагає)."""
-    global userbot, userbot_error, channel_entity
+    global userbot, channel_entity
     if not USE_USERBOT:
         print("Публікація: через бота (він має бути адміном каналу)")
         return
     if TelegramClient is None:
-        userbot_error = "не встановлено telethon (pip install telethon hachoir)"
-        print(f"⚠️ {userbot_error}")
-        return
-
-    client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+        raise RuntimeError("Для публікації від свого імені встанови: pip install telethon hachoir")
+    userbot = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+    await userbot.connect()
+    if not await userbot.is_user_authorized():
+        raise RuntimeError("STRING_SESSION недійсна — створи нову")
+    me = await userbot.get_me()
+    await userbot.get_dialogs()  # щоб Telethon знав канали за числовим id
     try:
-        await client.connect()
-        if not await client.is_user_authorized():
-            await client.disconnect()
-            userbot_error = "STRING_SESSION недійсна — створи нову через gen_session.py"
-            print(f"⚠️ {userbot_error}")
-            return
-        me = await client.get_me()
-    except Exception as e:
-        userbot_error = str(e)
-        print(f"⚠️ Не вдалося підключити акаунт: {e}")
-        return
-
-    userbot = client
-    target = _tg_target(CHANNEL_ID)
-    try:
-        try:
-            channel_entity = await userbot.get_entity(target)
-        except ValueError:
-            # числовий id Telethon знає лише після завантаження діалогів
-            await userbot.get_dialogs()
-            channel_entity = await userbot.get_entity(target)
+        channel_entity = await userbot.get_entity(CHANNEL_ID)
         print(f"Публікація: від акаунта {me.first_name} → {getattr(channel_entity, 'title', CHANNEL_ID)}")
     except Exception as e:
         channel_entity = None
@@ -808,33 +703,21 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Скасовано.", reply_markup=ReplyKeyboardRemove())
 
 
-async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
-    """Будь-яка необроблена помилка тепер потрапляє в лог Render (а не
-    губиться мовчки), і, якщо можливо, адміну прийде повідомлення замість
-    вічної «загрузки» кнопки."""
-    logger.exception("Необроблена помилка", exc_info=context.error)
-    try:
-        chat_id = None
-        if isinstance(update, Update):
-            if update.effective_chat:
-                chat_id = update.effective_chat.id
-        if chat_id:
-            await context.bot.send_message(chat_id, f"⚠️ Внутрішня помилка: {context.error}")
-    except Exception:
-        pass
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/start — без нього повідомлення /start ні з чим не збігається і бот
+    мовчить у відповідь на найперше, що зазвичай пише людина."""
+    if not await check_access(update):
+        return
+    await update.message.reply_text(
+        "🤖 Бот готовий. Надішли текст новини (можна з фото/відео) — я підготую пост."
+    )
 
 
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .post_init(_post_init)
-        .post_shutdown(_post_shutdown)
-        .build()
-    )
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).post_shutdown(_post_shutdown).build()
 
     entry_filter = filters.UpdateType.MESSAGE & (
         (filters.TEXT & ~filters.COMMAND)
@@ -845,6 +728,7 @@ if __name__ == "__main__":
     )
 
     app.add_handler(MessageHandler(entry_filter, handle_message))
+    app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("checkchannel", check_channel))
     app.add_handler(CallbackQueryHandler(handle_publish, pattern="^publish$"))
@@ -852,6 +736,5 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(handle_fix, pattern="^fix$"))
     # Останнім: усе, що не підійшло вище (аудіо, голосові, стікери...)
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & ~filters.COMMAND, handle_unsupported))
-    app.add_error_handler(on_error)
     print("Бот запущено")
     app.run_polling()
