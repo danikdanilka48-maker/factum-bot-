@@ -2,6 +2,7 @@ import os
 import re
 import html
 import shutil
+import logging
 import tempfile
 import asyncio
 import threading
@@ -33,6 +34,11 @@ try:  # Telethon потрібен лише для публікації від і
     from telethon.tl.types import DocumentAttributeAnimated
 except ImportError:
     TelegramClient = None
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
+)
+logger = logging.getLogger("factum_bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
@@ -159,12 +165,9 @@ def build_post(raw_ai_text: str, emoji: str) -> str:
     return post
 
 
-def call_groq(messages, temperature=0.15, timeout=30):
-    """Викликати Groq chat completion, перебираючи моделі зі списку
-    GROQ_MODELS по черзі. Якщо модель впирається в ліміт токенів
-    (rate_limit_exceeded) чи повертає іншу помилку — пробуємо наступну
-    модель зі списку. Якщо жодна модель не спрацювала — кидаємо
-    останню отриману помилку."""
+def _call_groq_sync(messages, temperature=0.15, timeout=30):
+    """Синхронний виклик Groq (звичайний requests.post). НЕ викликати напряму
+    з async-коду — він блокує процес; для цього є call_groq нижче."""
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
 
@@ -189,7 +192,15 @@ def call_groq(messages, temperature=0.15, timeout=30):
     raise last_error if last_error else Exception("Усі моделі Groq недоступні")
 
 
-def ask_groq(text, importance, temperature=0.15):
+async def call_groq(messages, temperature=0.15, timeout=30):
+    """Async-обгортка над Groq. Бот однопроцесний і обробляє одне оновлення за
+    раз: звичайний requests.post усередині async-обробника заморожує ВЕСЬ
+    бот (у тому числі натискання кнопок) на час запиту. asyncio.to_thread
+    виносить запит у окремий потік, щоб решта бота лишалась чутливою."""
+    return await asyncio.to_thread(_call_groq_sync, messages, temperature, timeout)
+
+
+async def ask_groq(text, importance, temperature=0.15):
     emoji = "⚡️⚡️⚡️" if importance == "важлива" else "⚡️"
 
     prompt = f"""Ти — редактор українського новинного Telegram-каналу.
@@ -211,16 +222,16 @@ def ask_groq(text, importance, temperature=0.15):
 Текст новини:
 {text}"""
 
-    raw = call_groq([{"role": "user", "content": prompt}], temperature=temperature)
+    raw = await call_groq([{"role": "user", "content": prompt}], temperature=temperature)
     return build_post(raw, emoji)
 
 
-def _make_post(text, importance, temperature=0.15):
+async def _make_post(text, importance, temperature=0.15):
     """Готовий пост. Якщо тексту немає (тільки медіа) — Groq не викликаємо,
     щоб модель нічого не вигадала: піде лише підпис каналу."""
     if not text:
         return CHANNEL_FOOTER.strip()
-    return ask_groq(text, importance, temperature) + CHANNEL_FOOTER
+    return await ask_groq(text, importance, temperature) + CHANNEL_FOOTER
 
 
 def get_keyboard():
@@ -388,14 +399,21 @@ def _post_to_html(post):
     return "".join(out)
 
 
+# Скільки чекати одну мережеву операцію публікації від акаунта, перш ніж
+# здатись і показати помилку замість вічного «завантаження» кнопки.
+USERBOT_STEP_TIMEOUT = 120
+
+
 async def _download_item(bot, item, tmpdir, index):
     """Скачати медіа, яке ти надіслав боту, у тимчасову папку."""
     try:
-        tg_file = await bot.get_file(item["file_id"])
+        tg_file = await asyncio.wait_for(bot.get_file(item["file_id"]), USERBOT_STEP_TIMEOUT)
     except BadRequest as e:
         if "too big" in str(e).lower():
             raise RuntimeError("файл більший за 20 МБ — Bot API не дозволяє його завантажити") from e
         raise
+    except asyncio.TimeoutError as e:
+        raise RuntimeError("Telegram не відповів на запит файлу (тайм-аут)") from e
     if item["type"] == "document":
         name = os.path.basename(item.get("name") or "file")
     else:
@@ -403,7 +421,10 @@ async def _download_item(bot, item, tmpdir, index):
     folder = os.path.join(tmpdir, str(index))
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, name)
-    await tg_file.download_to_drive(custom_path=path)
+    try:
+        await asyncio.wait_for(tg_file.download_to_drive(custom_path=path), USERBOT_STEP_TIMEOUT)
+    except asyncio.TimeoutError as e:
+        raise RuntimeError(f"Скачування файлу зависло довше {USERBOT_STEP_TIMEOUT} с") from e
     return path
 
 
@@ -438,23 +459,34 @@ async def _deliver_as_user(bot, media_list, post_text):
                 extra["force_document"] = True  # щоб фото-файли не стискались у фото
             elif kinds == {"animation"}:
                 extra["attributes"] = [DocumentAttributeAnimated()]  # лишається гіфкою
-            await userbot.send_file(
-                target,
-                file=paths if len(paths) > 1 else paths[0],
-                caption=caption,
-                parse_mode="html" if caption else None,
-                supports_streaming=True,
-                **extra,
-            )
+            try:
+                await asyncio.wait_for(
+                    userbot.send_file(
+                        target,
+                        file=paths if len(paths) > 1 else paths[0],
+                        caption=caption,
+                        parse_mode="html" if caption else None,
+                        supports_streaming=True,
+                        **extra,
+                    ),
+                    USERBOT_STEP_TIMEOUT,
+                )
+            except asyncio.TimeoutError as e:
+                raise RuntimeError(f"Відправка в канал зависла довше {USERBOT_STEP_TIMEOUT} с") from e
         if text and not caption_ok:
-            await userbot.send_message(target, text, parse_mode="html")
+            try:
+                await asyncio.wait_for(
+                    userbot.send_message(target, text, parse_mode="html"), USERBOT_STEP_TIMEOUT
+                )
+            except asyncio.TimeoutError as e:
+                raise RuntimeError(f"Відправка тексту зависла довше {USERBOT_STEP_TIMEOUT} с") from e
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 async def _show_result(context, chat_id, text, media_list, importance, temperature=0.15):
     """Згенерувати пост, запам'ятати його разом з медіа і показати адміну."""
-    result = _make_post(text, importance, temperature)
+    result = await _make_post(text, importance, temperature)
     context.user_data["last_result"] = result
     context.user_data["last_media"] = media_list
     await _deliver(context.bot, chat_id, media_list, result, get_keyboard())
@@ -622,7 +654,7 @@ async def handle_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Текст:
 {clean_result}"""
-        raw = call_groq([{"role": "user", "content": fix_prompt}], temperature=0.1)
+        raw = await call_groq([{"role": "user", "content": fix_prompt}], temperature=0.1)
 
         emoji = "⚡️⚡️⚡️" if importance == "важлива" else "⚡️"
         result = build_post(raw, emoji) + CHANNEL_FOOTER
@@ -776,6 +808,22 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Скасовано.", reply_markup=ReplyKeyboardRemove())
 
 
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    """Будь-яка необроблена помилка тепер потрапляє в лог Render (а не
+    губиться мовчки), і, якщо можливо, адміну прийде повідомлення замість
+    вічної «загрузки» кнопки."""
+    logger.exception("Необроблена помилка", exc_info=context.error)
+    try:
+        chat_id = None
+        if isinstance(update, Update):
+            if update.effective_chat:
+                chat_id = update.effective_chat.id
+        if chat_id:
+            await context.bot.send_message(chat_id, f"⚠️ Внутрішня помилка: {context.error}")
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
     loop = asyncio.new_event_loop()
@@ -804,5 +852,6 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(handle_fix, pattern="^fix$"))
     # Останнім: усе, що не підійшло вище (аудіо, голосові, стікери...)
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & ~filters.COMMAND, handle_unsupported))
+    app.add_error_handler(on_error)
     print("Бот запущено")
     app.run_polling()
